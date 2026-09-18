@@ -988,6 +988,438 @@ async def fetch_page_browser(url):
 
 
 # ============================================================
+# BROWSER DEBUG V2
+# ============================================================
+# This block is intentionally generic. It does not hard-code TitanCloud,
+# GDFlix, Amazon, or any other domain.
+#
+# Important difference from the old browser code:
+# - Do not treat every browser request as a useful link.
+# - Inspect the rendered DOM for visible anchors/buttons.
+# - For useful buttons, click them and capture navigation/popup/download
+#   request URLs plus URLs contained in API/JSON responses.
+# - Do not wait for or save a multi-GB media download. The request URL is
+#   captured before the file is downloaded.
+
+from dataclasses import dataclass, field
+from urllib.parse import urljoin
+
+
+@dataclass
+class PageResult:
+    url: str
+    text: str
+    status_code: int = 200
+    title: str = ""
+    interactive: list = field(default_factory=list)
+
+
+def _extract_urls_from_text(base_url, text):
+    """Extract HTTP(S) URLs from JSON/text returned by APIs or scripts."""
+    if not text:
+        return []
+
+    result = []
+    seen = set()
+
+    # Absolute URLs.
+    patterns = [
+        r'https?://[^\s\"\'<>\\]+',
+        r'(?i)(?:download|url|href|link|fileUrl|downloadUrl|directUrl|streamUrl)\s*[=:]\s*[\"\']([^\"\']+)',
+    ]
+
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            values = match if isinstance(match, tuple) else [match]
+            for value in values:
+                value = str(value).strip().rstrip("'\"),;]}")
+                u = normalize_link(base_url, value)
+                if u and u not in seen:
+                    seen.add(u)
+                    result.append(u)
+
+    return result
+
+
+def _looks_like_download_response(url, headers):
+    """Return True for responses that are likely file/download results."""
+    h = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+    ctype = h.get("content-type", "")
+    disp = h.get("content-disposition", "")
+    path = urlparse(url).path.lower()
+
+    if "attachment" in disp:
+        return True
+    if any(x in ctype for x in (
+        "video/", "audio/", "application/octet-stream",
+        "application/x-matroska", "application/vnd.apple.mpegurl",
+    )):
+        return True
+    if path.endswith((
+        ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm",
+        ".ts", ".m3u8", ".zip", ".rar", ".7z", ".pdf",
+    )):
+        return True
+    return False
+
+
+def _button_score(text):
+    """Rank likely link-producing controls without clicking dangerous actions."""
+    t = (text or "").strip().lower()
+    if not t:
+        return 0
+
+    blocked = (
+        "logout", "log out", "delete", "remove", "cancel",
+        "sign out", "unsubscribe", "close account", "checkout",
+        "purchase", "pay now", "login", "log in", "sign in",
+        "signup", "sign up", "register", "accept cookies",
+    )
+    if any(x in t for x in blocked):
+        return 0
+
+    score = 0
+    for word in (
+        "download", "direct", "mkv", "mp4", "avi", "mov", "webm",
+        "mirror", "server", "stream", "generate", "get link",
+        "get download", "file", "link", "1080", "720", "480", "360",
+        "2160", "1440",
+    ):
+        if word in t:
+            score += 1
+    return score
+
+
+async def _get_interactive_elements_v2(page):
+    """Return visible anchors/buttons and useful attributes from the live DOM."""
+    selector = (
+        "a, button, input[type=button], input[type=submit], "
+        "[role=button], [role=link]"
+    )
+    try:
+        return await page.locator(selector).evaluate_all(
+            """els => els.map((el, index) => {
+                const r = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                return {
+                    index,
+                    tag: el.tagName.toLowerCase(),
+                    text,
+                    href: el.getAttribute('href'),
+                    target: el.getAttribute('target'),
+                    download: el.getAttribute('download'),
+                    onclick: el.getAttribute('onclick'),
+                    dataHref: el.getAttribute('data-href'),
+                    dataUrl: el.getAttribute('data-url'),
+                    dataLink: el.getAttribute('data-link'),
+                    dataDownload: el.getAttribute('data-download'),
+                    dataTarget: el.getAttribute('data-target'),
+                    dataFile: el.getAttribute('data-file'),
+                    dataPath: el.getAttribute('data-path'),
+                    formaction: el.getAttribute('formaction'),
+                    visible: !!(r.width && r.height) && style.display !== 'none' && style.visibility !== 'hidden'
+                };
+            })"""
+        )
+    except Exception as e:
+        print("[BROWSER] Interactive scan error:", e)
+        return []
+
+
+async def _inspect_button_v2(page, item, base_url):
+    """Click one useful control and return URLs it causes without downloading files."""
+    text = (item.get("text") or "").strip()
+    if not _button_score(text):
+        return []
+
+    urls = []
+    seen = set()
+    responses = []
+    popup_pages = []
+
+    def add(u):
+        u = normalize_link(base_url, u)
+        if u and u not in seen and not _is_obvious_asset(u):
+            seen.add(u)
+            urls.append(u)
+
+    # First collect an href/data URL without clicking.
+    for key in (
+        "href", "dataHref", "dataUrl", "dataLink", "dataDownload",
+        "dataTarget", "dataFile", "dataPath", "formaction",
+    ):
+        value = item.get(key)
+        if value:
+            add(value)
+            for u in _extract_urls_from_text(base_url, str(value)):
+                add(u)
+
+    # We only click controls that are likely to produce a useful result.
+    # We do NOT use expect_download(), because that can make Playwright spool
+    # a multi-GB MKV into temporary storage. We capture the request URL instead.
+    selector = (
+        "a, button, input[type=button], input[type=submit], "
+        "[role=button], [role=link]"
+    )
+
+    try:
+        locator = page.locator(selector)
+        count = await locator.count()
+        element = None
+
+        # Prefer exact visible text after hydration.
+        for i in range(count):
+            candidate = locator.nth(i)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                candidate_text = (await candidate.inner_text()).strip()
+                if not candidate_text:
+                    candidate_text = (await candidate.get_attribute("aria-label") or "").strip()
+                if candidate_text == text:
+                    element = candidate
+                    break
+            except Exception:
+                continue
+
+        if element is None:
+            index = item.get("index")
+            if isinstance(index, int) and index < count:
+                candidate = locator.nth(index)
+                if await candidate.is_visible():
+                    element = candidate
+
+        if element is None:
+            return urls
+
+        def capture_response(response):
+            try:
+                u = response.url
+                if u.startswith(("http://", "https://")):
+                    responses.append(response)
+            except Exception:
+                pass
+
+        page.on("response", capture_response)
+
+        # Reload the original page before each control. A previous button may
+        # have navigated or changed the DOM.
+        try:
+            await page.goto(
+                base_url,
+                wait_until="domcontentloaded",
+                timeout=BROWSER_TIMEOUT_MS,
+            )
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1800)
+
+            # Re-find the element after hydration instead of using a stale
+            # locator from the previous DOM.
+            locator = page.locator(selector)
+            count = await locator.count()
+            element = None
+            for i in range(count):
+                candidate = locator.nth(i)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    candidate_text = (await candidate.inner_text()).strip()
+                    if not candidate_text:
+                        candidate_text = (await candidate.get_attribute("aria-label") or "").strip()
+                    if candidate_text == text:
+                        element = candidate
+                        break
+                except Exception:
+                    continue
+            if element is None:
+                return urls
+        except Exception as e:
+            print("[BROWSER] Could not reload page for control:", text[:100], e)
+            return urls
+
+        try:
+            await element.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        try:
+            await element.click(timeout=7000, no_wait_after=True)
+        except Exception as e:
+            print("[BROWSER] Click failed:", text[:100], e)
+
+        await page.wait_for_timeout(3500)
+
+        # Current page navigation.
+        add(page.url)
+
+        # Process response bodies. This is the important part missing from the
+        # previous extractor: an API URL itself is not the desired link, but the
+        # JSON returned by that API may contain the desired link.
+        for response in list(responses):
+            try:
+                headers = await response.all_headers()
+                u = response.url
+                if _looks_like_download_response(u, headers):
+                    add(u)
+                ctype = (headers.get("content-type") or "").lower()
+                if "json" in ctype or "text" in ctype or "javascript" in ctype or "/api/" in u:
+                    body = await response.text()
+                    for found in _extract_urls_from_text(u, body):
+                        add(found)
+            except Exception:
+                continue
+
+        # Check newly opened pages/tabs.
+        try:
+            for p in page.context.pages:
+                if p is page:
+                    continue
+                if p not in popup_pages:
+                    popup_pages.append(p)
+        except Exception:
+            pass
+
+        for popup in popup_pages:
+            try:
+                await popup.wait_for_load_state("domcontentloaded", timeout=4000)
+            except Exception:
+                pass
+            add(popup.url)
+            try:
+                body = await popup.content()
+                for u in extract_links_from_html(popup.url, body):
+                    add(u)
+            except Exception:
+                pass
+
+        page.remove_listener("response", capture_response)
+
+    except Exception as e:
+        print("[BROWSER] Button inspection error:", text[:100], e)
+
+    return urls
+
+
+async def fetch_page_browser(url):
+    """Render a page in real Chromium and inspect its live interactive DOM."""
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError("Playwright Python package is not installed.")
+
+    if not await ensure_playwright_browser():
+        raise RuntimeError(
+            "Playwright Chromium is not installed. "
+            "Install it in the Docker image."
+        )
+
+    network_urls = []
+    network_seen = set()
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        context = await browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1366, "height": 768},
+            ignore_https_errors=True,
+            accept_downloads=False,
+        )
+        page = await context.new_page()
+
+        def capture_request(request):
+            try:
+                u = request.url
+                if not u.startswith(("http://", "https://")):
+                    return
+                # Only retain potentially useful requests here. Static resources,
+                # analytics and the site's own JS chunks are not debug links.
+                if _is_obvious_asset(u):
+                    return
+                if u not in network_seen:
+                    network_seen.add(u)
+                    network_urls.append(u)
+            except Exception:
+                pass
+
+        page.on("request", capture_request)
+
+        response = None
+        try:
+            response = await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=BROWSER_TIMEOUT_MS,
+            )
+        except Exception as e:
+            print("[BROWSER GOTO ERROR]", url, e)
+
+        # Give React/Next/Vue/etc. time to hydrate and make API calls.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(2500)
+
+        current_url = page.url
+        rendered_html = await page.content()
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+
+        # Normal rendered links.
+        links = extract_links_from_html(current_url, rendered_html)
+        seen = set(links)
+        links = [u for u in links if not _is_obvious_asset(u)]
+        seen = set(links)
+
+        # Keep useful network URLs, but don't present every API call as if it
+        # were a download. We still keep file-like responses and non-obvious
+        # navigation URLs for debugging.
+        for u in network_urls:
+            _add_browser_url(links, seen, u)
+
+        # Visible interactive controls. This is separate from links so the user
+        # can see what a human sees on the page.
+        interactive = await _get_interactive_elements_v2(page)
+        interactive = [
+            x for x in interactive
+            if x.get("visible") and (x.get("text") or x.get("href"))
+        ]
+
+        # Click only likely link-producing controls. We intentionally limit this
+        # to 20 controls to avoid hammering a page with dozens of unrelated UI
+        # buttons.
+        useful_controls = [
+            x for x in interactive
+            if _button_score(x.get("text", ""))
+        ][:20]
+
+        for item in useful_controls:
+            print("[BROWSER] Inspecting control:", item.get("text", "")[:120])
+            for u in await _inspect_button_v2(page, item, current_url):
+                _add_browser_url(links, seen, u)
+
+        await browser.close()
+
+        return PageResult(
+            url=current_url,
+            text=rendered_html,
+            status_code=(response.status if response is not None else 200),
+            title=title,
+            interactive=interactive,
+        ), links
+
+# ============================================================
 # FETCH PAGE
 # ============================================================
 
@@ -1423,147 +1855,100 @@ route
 
 # ============================================================
 
-def format_debug_links(
-links
-):
-
-    if not links:
-
-        return (
-            "❌ <b>No links found.</b>"
-        )
-
-    shown = links[
-        :MAX_DEBUG_LINKS
-    ]
+def format_debug_links(links, interactive=None):
+    interactive = interactive or []
+    shown = links[:MAX_DEBUG_LINKS]
 
     lines = [
-        f"🔗 <b>Links found: "
-        f"{len(links)}</b>",
-        ""
+        f"🔗 <b>Useful URLs found: {len(links)}</b>",
+        "",
     ]
 
-    for number, link in enumerate(
-        shown,
-        start=1
-    ):
+    if interactive:
+        lines.extend(["🖱 <b>Visible links / buttons</b>", ""])
+        for item in interactive[:60]:
+            text = (item.get("text") or "").strip()
+            if not text:
+                text = "(no visible text)"
+            if len(text) > 120:
+                text = text[:117] + "..."
+            href = item.get("href") or item.get("dataHref") or item.get("dataUrl") or item.get("dataDownload")
+            lines.append(f"• <b>{html.escape(text)}</b>")
+            if href:
+                u = normalize_link(item.get("pageUrl") or "https://example.com/", href)
+                if u:
+                    lines.append(f"  <code>{html.escape(u)}</code>")
+                else:
+                    lines.append(f"  <code>{html.escape(str(href)[:500])}</code>")
+            else:
+                lines.append("  <i>JavaScript button: inspected for resulting URL</i>")
+        lines.extend(["", "🔗 <b>URLs you can use in rules</b>", ""])
 
-        display = link
-
-        if len(display) > 700:
-
-            display = (
-                display[:697]
-                + "..."
-            )
-
-        lines.append(
-            f"<b>{number}.</b> "
-            f"<code>{html.escape(display)}</code>"
-        )
+    if not shown:
+        lines.append("❌ No usable HTTP(S) URLs found.")
+    else:
+        for number, link in enumerate(shown, start=1):
+            display = link if len(link) <= 700 else link[:697] + "..."
+            lines.append(f"<b>{number}.</b> <code>{html.escape(display)}</code>")
 
     if len(links) > MAX_DEBUG_LINKS:
-
-        lines.extend([
-            "",
-            f"⚠️ Showing first "
-            f"{MAX_DEBUG_LINKS} links."
-        ])
+        lines.extend(["", f"⚠️ Showing first {MAX_DEBUG_LINKS} URLs."])
 
     lines.extend([
         "",
-        "👉 Reply with the <b>number</b> "
-        "of the link you want to debug.",
+        "👉 Reply with the <b>number</b> of the URL you want to debug.",
         "",
-        "Send /cancel to stop."
+        "Send /cancel to stop.",
     ])
+    return "\n".join(lines)
 
-    return "\n".join(
-        lines
-    )
 
-async def debug_page(
-update,
-context,
-url
-):
-
+async def debug_page(update, context, url):
     status = await update.message.reply_text(
-        "🔎 Fetching page...",
-        disable_web_page_preview=True
+        "🔎 Opening page in Chromium and inspecting the live page...",
+        disable_web_page_preview=True,
     )
 
     try:
-
-        session = context.user_data.get(
-            "session"
-        )
-
+        session = context.user_data.get("session")
         if session is None:
-
             session = requests.Session()
+            context.user_data["session"] = session
 
-            context.user_data[
-                "session"
-            ] = session
+        response, links = await fetch_page_browser(url)
 
-        response, links = await fetch_page(
-            session,
-            url
-        )
+        context.user_data["debug_links"] = links
+        context.user_data["debug_current_url"] = response.url
 
-        # Save debug state
-        context.user_data[
-            "debug_links"
-        ] = links
+        interactive = response.interactive or []
+        # Add the page URL to each item for safe display/normalization.
+        for item in interactive:
+            item["pageUrl"] = response.url
+        context.user_data["debug_interactive"] = interactive
 
-        context.user_data[
-            "debug_current_url"
-        ] = response.url
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        title = "Unknown"
-
-        if soup.title:
-
-            title = soup.title.get_text(
-                " ",
-                strip=True
-            )
-
+        title = response.title or "Unknown"
         message = (
-            "✅ <b>Page fetched</b>\n\n"
-            f"<b>Status:</b> "
-            f"{response.status_code}\n\n"
-            f"<b>Final URL:</b>\n"
-            f"<code>{html.escape(response.url)}</code>\n\n"
-            f"<b>Title:</b>\n"
-            f"{html.escape(title[:500])}\n\n"
+            "✅ <b>Browser page inspected</b>\n\n"
+            f"<b>Status:</b> {response.status_code}\n\n"
+            f"<b>Final URL:</b>\n<code>{html.escape(response.url)}</code>\n\n"
+            f"<b>Title:</b>\n{html.escape(title[:500])}\n\n"
         )
-
-        message += format_debug_links(
-            links
-        )
+        message += format_debug_links(links, interactive)
 
         await status.edit_text(
             message,
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
 
     except Exception as e:
-
+        print("[DEBUG ERROR]", repr(e))
         await status.edit_text(
-            "❌ <b>Failed</b>\n\n"
+            "❌ <b>Browser debug failed</b>\n\n"
             f"<code>{html.escape(str(e)[:1500])}</code>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
-# ============================================================
 
 # AUTOMATIC RESOLVE
 
