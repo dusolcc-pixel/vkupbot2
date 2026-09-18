@@ -1713,6 +1713,80 @@ route
     )
 
     # --------------------------------------------------------
+    # DIRECT-LINK ROUTE
+    #
+    # Find the desired domain directly on the first page.
+    # This avoids forcing a meaningless Step 1 when the
+    # target link is already present.
+    # --------------------------------------------------------
+
+    direct_targets = route.get(
+        "direct_targets",
+        []
+    )
+
+    if direct_targets:
+
+        print(
+            "[DIRECT] Targets:",
+            direct_targets
+        )
+
+        response, links = await fetch_page(
+            session,
+            current_url
+        )
+
+        print(
+            "[DIRECT] Current URL:",
+            response.url
+        )
+
+        selected = None
+
+        # A redirect to the target is also accepted.
+        for target in direct_targets:
+
+            if domain_matches(
+                response.url,
+                target
+            ):
+
+                selected = response.url
+                break
+
+        # Otherwise choose the first matching link from the
+        # rendered/filtered page output.
+        if selected is None:
+            selected = find_target_link(
+                links,
+                direct_targets
+            )
+
+        if selected is None:
+            raise RuntimeError(
+                "Direct route: none of these target domains "
+                f"were found: {', '.join(direct_targets)}"
+            )
+
+        print(
+            "[DIRECT] Selected:",
+            selected
+        )
+
+        history.append({
+            "type": "direct",
+            "targets": direct_targets,
+            "input": current_url,
+            "selected": selected
+        })
+
+        return extract_final_url(
+            selected,
+            route.get("final") or {"type": "current_url"}
+        ), history
+
+    # --------------------------------------------------------
     # STEP LOOP
     # --------------------------------------------------------
 
@@ -2306,6 +2380,7 @@ context: ContextTypes.DEFAULT_TYPE
         "👋 <b>Multi-Step Link Bot</b>\n\n"
         "🐞 /debug — debug a link\n"
         "➕ /addroute — create route\n"
+        "🎯 /adddirect — direct-link route\n"
         "✏️ /editroute — edit route\n"
         "📂 /routes — list routes\n"
         "🗑 /deleteroute — delete route\n"
@@ -2387,7 +2462,10 @@ context: ContextTypes.DEFAULT_TYPE
         "new_route"
     ] = {
         "steps": [],
-        "final": None
+        "direct_targets": [],
+        "final": {
+            "type": "current_url"
+        }
     }
 
     context.user_data[
@@ -2399,6 +2477,48 @@ context: ContextTypes.DEFAULT_TYPE
         "Send a route name.\n\n"
         "Example:\n"
         "<code>hubcloud</code>",
+        parse_mode="HTML"
+    )
+
+# ============================================================
+
+# /ADDDIRECT
+
+# Direct-link route: find the desired target directly on the
+# first fetched page. No artificial Step 1 is required.
+
+# ============================================================
+
+async def adddirect_command(
+update: Update,
+context: ContextTypes.DEFAULT_TYPE
+):
+
+    route = context.user_data.get(
+        "new_route"
+    )
+
+    if not route:
+
+        await update.message.reply_text(
+            "❌ You are not creating a route.\n\n"
+            "Use /addroute first."
+        )
+
+        return
+
+    context.user_data[
+        "mode"
+    ] = "route_direct"
+
+    await update.message.reply_text(
+        "🎯 <b>Direct-link route</b>\n\n"
+        "Send the target domain(s) that should be taken "
+        "directly from the first page.\n\n"
+        "Example:\n"
+        "<code>cdn.example.com</code>\n\n"
+        "Multiple alternatives:\n"
+        "<code>cdn.example.com, mirror.example.net</code>",
         parse_mode="HTML"
     )
 
@@ -2557,6 +2677,17 @@ context: ContextTypes.DEFAULT_TYPE
                 f"<code>{html.escape(', '.join(aliases))}</code>"
             )
 
+        direct_targets = route.get(
+            "direct_targets",
+            []
+        )
+
+        if direct_targets:
+            lines.append(
+                "Direct: "
+                f"<code>{html.escape(', '.join(direct_targets))}</code>"
+            )
+
         for number, step in enumerate(
             route.get(
                 "steps",
@@ -2628,6 +2759,10 @@ context
             "steps",
             []
         ),
+        "direct_targets": route.get(
+            "direct_targets",
+            []
+        ),
         "final": route.get(
             "final"
         )
@@ -2643,10 +2778,25 @@ context
         f"<b>Name:</b> "
         f"{html.escape(name)}",
         f"<b>Main:</b> "
-        f"<code>{html.escape(str(route.get('main_domain')))}</code>",
+        f"<code>{html.escape(str(route.get('main_domain')))}</code>"
+    ]
+
+    direct_targets = route.get(
+        "direct_targets",
+        []
+    )
+
+    if direct_targets:
+        lines.extend([
+            "",
+            "<b>Direct targets:</b>",
+            f"<code>{html.escape(', '.join(direct_targets))}</code>"
+        ])
+
+    lines.extend([
         "",
         "<b>Steps:</b>"
-    ]
+    ])
 
     for number, step in enumerate(
         route["steps"],
@@ -3227,8 +3377,67 @@ context: ContextTypes.DEFAULT_TYPE
 
         await update.message.reply_text(
             "✅ Main domain saved.\n\n"
-            "Now use /addstep to add Step 1.",
+            "Now choose the route type:\n\n"
+            "🎯 /adddirect — desired link is already on the first page\n"
+            "➕ /addstep — the link needs one or more intermediate steps\n\n"
+            "Send /cancel to stop.",
             parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # ROUTE DIRECT TARGETS
+    # ========================================================
+
+    if mode == "route_direct":
+
+        route = context.user_data[
+            "new_route"
+        ]
+
+        raw_domains = text.split(
+            ","
+        )
+
+        targets = []
+
+        for domain in raw_domains:
+
+            domain = clean_domain(
+                domain
+            )
+
+            if (
+                domain
+                and domain not in targets
+            ):
+
+                targets.append(
+                    domain
+                )
+
+        if not targets:
+
+            await update.message.reply_text(
+                "❌ No valid target domains."
+            )
+
+            return
+
+        route[
+            "direct_targets"
+        ] = targets
+
+        route[
+            "final"
+        ] = {
+            "type": "current_url"
+        }
+
+        await save_new_route(
+            update,
+            context
         )
 
         return
@@ -4267,6 +4476,13 @@ def main():
         CommandHandler(
             "addroute",
             addroute_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "adddirect",
+            adddirect_command
         )
     )
 
