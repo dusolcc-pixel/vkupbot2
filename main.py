@@ -5,49 +5,25 @@ import html
 import requests
 import asyncio
 
-# ============================================================
-# DOMAINS THAT MUST USE A REAL BROWSER (CLICK METHOD)
-# ============================================================
-#
-# Add domains here manually whenever a site needs JavaScript,
-# rendered buttons, generated mirrors, or click actions.
-#
-# Example:
-#     "titancloud.site",   # click method
-#     "anothercloud.example",  # click method
-#
+# Domains that must use a real browser (Cloudflare-protected)
 BROWSER_FIRST_DOMAINS = {
-    "titancloud.site",  # click method
-    # Add more JavaScript/click sites here manually:
-    # "technocloud.site",
-    # "examplecloud.com",
-}
-
-# GDFlix keeps the old fast curl_cffi method.
-# Add new GDFlix mirrors here if they do not already contain
-# the word "gdflix" in their hostname.
-GDFlIX_DOMAINS = {
     "gdflix.io",
     "gdflix.dad",
     "gdflix.net",
-    # "new-gdflix-mirror.example",
+    # add other gdflix mirrors here as they change
 }
 
-# Also keep the old automatic marker behavior. Any hostname
-# containing "gdflix" is treated as a GDFlix/curl_cffi site.
-GDFlIX_DOMAIN_MARKER = "gdflix"
-
+BROWSER_FALLBACK_STATUS_CODES = {403, 429, 503}
 BROWSER_TIMEOUT_MS = 30_000
 BROWSER_WAIT_MS = 6_000
 BROWSER_HEADLESS = True
-TELEGRAM_SAFE_LIMIT = 3900
 
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-    print("[WARN] Playwright is not installed. Browser domains will not work.")
+    print("[WARN] Playwright not installed. gdflix will not work.")
 
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -66,7 +42,7 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = ""
 
 ROUTES_FILE = "routes.json"
 
@@ -95,14 +71,32 @@ SPACEBIN_API = "https://spaceb.in/api/"
 
 
 def upload_to_spacebin(content):
-    """Upload text to Spacebin and return its public URL."""
+    """Upload text to Spacebin and return its public URL.
 
+    Tries the documented JSON API first, then multipart/form-data as a
+    compatibility fallback.  Spacebin documents both upload formats.
+    """
+
+    if content is None:
+        content = ""
+
+    content = str(content)
+
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+    }
+
+    last_error = None
+
+    # --------------------------------------------------------
+    # Preferred: documented JSON API.
+    # --------------------------------------------------------
     try:
         response = requests.post(
             SPACEBIN_API,
             json={"content": content},
             headers={
-                "User-Agent": HEADERS["User-Agent"],
+                **headers,
                 "Content-Type": "application/json",
             },
             timeout=30,
@@ -111,18 +105,59 @@ def upload_to_spacebin(content):
         response.raise_for_status()
         data = response.json()
 
-        if data.get("error"):
-            raise RuntimeError(str(data["error"]))
+        error_value = data.get("error")
+        if error_value:
+            raise RuntimeError(str(error_value))
 
-        paste_id = (data.get("payload") or {}).get("id")
+        payload = data.get("payload") or {}
+        paste_id = payload.get("id") or data.get("id")
 
-        if not paste_id:
-            raise RuntimeError("Spacebin did not return a paste ID.")
+        if paste_id:
+            return f"https://spaceb.in/{paste_id}"
 
-        return f"https://spaceb.in/{paste_id}"
+        raise RuntimeError(
+            "Spacebin response did not contain a paste ID: "
+            + response.text[:500]
+        )
 
     except Exception as e:
-        print("[SPACEBIN ERROR]", e)
+        last_error = e
+        print("[SPACEBIN JSON ERROR]", repr(e))
+
+    # --------------------------------------------------------
+    # Fallback: multipart/form-data.
+    # Spacebin documents this upload format as well.
+    # --------------------------------------------------------
+    try:
+        response = requests.post(
+            SPACEBIN_API,
+            files={"content": (None, content)},
+            headers=headers,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        error_value = data.get("error")
+        if error_value:
+            raise RuntimeError(str(error_value))
+
+        payload = data.get("payload") or {}
+        paste_id = payload.get("id") or data.get("id")
+
+        if paste_id:
+            return f"https://spaceb.in/{paste_id}"
+
+        raise RuntimeError(
+            "Spacebin multipart response did not contain a paste ID: "
+            + response.text[:500]
+        )
+
+    except Exception as e:
+        print("[SPACEBIN MULTIPART ERROR]", repr(e))
+        if last_error is not None:
+            print("[SPACEBIN LAST ERROR]", repr(last_error))
         return None
 
 
@@ -257,338 +292,6 @@ def domain_matches(
         return False
 
 
-
-# ============================================================
-# BROWSER / CLICK HELPERS
-# ============================================================
-
-from dataclasses import dataclass
-
-
-@dataclass
-class PageResult:
-    url: str
-    text: str
-    status_code: int = 200
-    title: str = ""
-
-
-def hostname_of(url):
-    try:
-        return (urlparse(url).hostname or "").lower()
-    except Exception:
-        return ""
-
-
-def domain_in_list(url, domains):
-    host = hostname_of(url)
-    if not host:
-        return False
-
-    for domain in domains:
-        domain = clean_domain(domain)
-        if host == domain or host.endswith("." + domain):
-            return True
-
-    return False
-
-
-def should_use_browser(url):
-    return domain_in_list(url, BROWSER_FIRST_DOMAINS)
-
-
-def should_use_gdflix(url):
-    host = hostname_of(url)
-    if not host:
-        return False
-
-    if domain_in_list(url, GDFlIX_DOMAINS):
-        return True
-
-    return GDFlIX_DOMAIN_MARKER in host
-
-
-def _browser_asset(url):
-    path = urlparse(url).path.lower()
-    bad = (
-        ".js", ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif",
-        ".webp", ".ico", ".woff", ".woff2", ".ttf", ".otf",
-        "googletagmanager", "google-analytics", "_next/static"
-    )
-    return any(x in path or x in url.lower() for x in bad)
-
-
-def _browser_useful_text(text):
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-
-    markers = (
-        "download", "direct", "mirror", "server", "generate",
-        "mkv", "mp4", "avi", "mov", "webm",
-        "stream", "get link", "file", "1080", "720", "480", "360"
-    )
-    blocked = (
-        "sign in", "login", "logout", "register", "subscribe",
-        "purchase", "delete", "cancel"
-    )
-
-    if any(x in t for x in blocked):
-        return False
-
-    return any(x in t for x in markers)
-
-
-async def _collect_browser_links(page, base_url):
-    links = []
-
-    # Normal visible anchors.
-    anchors = await page.locator("a[href]").evaluate_all(
-        """els => els.map(a => ({
-            href: a.href || "",
-            text: (a.innerText || a.textContent || "").trim(),
-            visible: !!(a.offsetWidth || a.offsetHeight || a.getClientRects().length)
-        }))"""
-    )
-
-    for item in anchors:
-        href = (item.get("href") or "").strip()
-        if not href or _browser_asset(href):
-            continue
-        if item.get("visible") or not item.get("text"):
-            if valid_url(href) and href not in links:
-                links.append(href)
-
-    # Rendered controls and their direct href/data-url values.
-    controls = await page.locator(
-        'button, [role="button"], input[type="button"], input[type="submit"], [onclick], [data-href], [data-url], [data-link]'
-    ).evaluate_all(
-        """els => els.map((el, i) => ({
-            i,
-            text: (el.innerText || el.textContent || el.value || "").trim(),
-            href: el.href || "",
-            dataHref: el.getAttribute("data-href") || "",
-            dataUrl: el.getAttribute("data-url") || "",
-            dataLink: el.getAttribute("data-link") || "",
-            visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-        }))"""
-    )
-
-    for item in controls:
-        if not item.get("visible"):
-            continue
-        candidates = [
-            item.get("href"),
-            item.get("dataHref"),
-            item.get("dataUrl"),
-            item.get("dataLink"),
-        ]
-        for href in candidates:
-            if not href:
-                continue
-            href = urljoin(base_url, href)
-            if valid_url(href) and not _browser_asset(href) and href not in links:
-                links.append(href)
-
-    return links
-
-
-async def _click_browser_controls(page, base_url):
-    discovered = []
-
-    # We inspect a bounded number of useful visible controls. Each click is
-    # isolated by reloading the page, so one control cannot destroy the next.
-    controls = await page.locator(
-        'button, [role="button"], input[type="button"], input[type="submit"], a'
-    ).evaluate_all(
-        """els => els.map((el, i) => ({
-            i,
-            tag: el.tagName,
-            text: (el.innerText || el.textContent || el.value || "").trim(),
-            href: el.href || "",
-            visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-        })).filter(x => x.visible && x.text)"""
-    )
-
-    useful = [
-        x for x in controls
-        if _browser_useful_text(x.get("text", ""))
-    ][:20]
-
-    for item in useful:
-        try:
-            await page.goto(
-                base_url,
-                wait_until="domcontentloaded",
-                timeout=BROWSER_TIMEOUT_MS
-            )
-            await page.wait_for_timeout(min(BROWSER_WAIT_MS, 4000))
-
-            target = page.locator(
-                'button, [role="button"], input[type="button"], input[type="submit"], a'
-            ).filter(has_text=item.get("text", ""))
-
-            if await target.count() == 0:
-                continue
-
-            control = target.first
-            if not await control.is_visible():
-                continue
-
-            captured = []
-            downloads = []
-
-            def on_request(req):
-                u = req.url
-                if valid_url(u) and not _browser_asset(u):
-                    if u not in captured:
-                        captured.append(u)
-
-            def on_download(download):
-                try:
-                    u = download.url
-                    if valid_url(u):
-                        downloads.append(u)
-                except Exception:
-                    pass
-
-            page.on("request", on_request)
-            page.on("download", on_download)
-
-            popup_url = None
-            try:
-                async with page.expect_popup(timeout=2500) as popup_info:
-                    await control.click(timeout=5000)
-                popup = await popup_info.value
-                try:
-                    await popup.wait_for_load_state("domcontentloaded", timeout=5000)
-                except Exception:
-                    pass
-                popup_url = popup.url
-                if valid_url(popup_url) and popup_url not in captured:
-                    captured.append(popup_url)
-                for u in await _collect_browser_links(popup, popup.url):
-                    if u not in discovered:
-                        discovered.append(u)
-                await popup.close()
-            except Exception:
-                try:
-                    await control.click(timeout=5000)
-                except Exception:
-                    continue
-
-            await page.wait_for_timeout(2500)
-
-            if downloads:
-                for u in downloads:
-                    if u not in discovered:
-                        discovered.append(u)
-
-            if popup_url and popup_url not in discovered:
-                discovered.append(popup_url)
-
-            for u in captured:
-                # Keep the clicked control's own href, direct results, and
-                # newly generated URLs. Ignore obvious browser assets.
-                if not _browser_asset(u) and u not in discovered:
-                    discovered.append(u)
-
-            for u in await _collect_browser_links(page, page.url):
-                if u not in discovered:
-                    discovered.append(u)
-
-        except Exception as e:
-            print("[BROWSER CLICK ERROR]", item.get("text"), e)
-            continue
-
-    return discovered
-
-
-async def fetch_page_browser(url):
-    if not PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError(
-            "Playwright is not installed. Add it to requirements.txt."
-        )
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=BROWSER_HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-
-        context = await browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            timezone_id="Asia/Kolkata",
-            ignore_https_errors=True,
-            accept_downloads=True,
-        )
-
-        page = await context.new_page()
-        try:
-            await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=BROWSER_TIMEOUT_MS
-            )
-            try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-
-            await page.wait_for_timeout(BROWSER_WAIT_MS)
-
-            # Trigger lazy-rendered controls.
-            try:
-                await page.evaluate(
-                    """async () => {
-                        for (let y = 0; y < document.body.scrollHeight; y += 700) {
-                            window.scrollTo(0, y);
-                            await new Promise(r => setTimeout(r, 150));
-                        }
-                        window.scrollTo(0, 0);
-                    }"""
-                )
-            except Exception:
-                pass
-
-            links = await _collect_browser_links(page, page.url)
-
-            clicked = await _click_browser_controls(page, url)
-            for u in clicked:
-                if valid_url(u) and not _browser_asset(u) and u not in links:
-                    links.append(u)
-
-            # Preserve rendered page text so debug output is useful.
-            page_text = await page.locator("body").inner_text()
-            title = await page.title()
-
-            return (
-                PageResult(
-                    url=page.url,
-                    text=(
-                        "<html><head><title>"
-                        + html.escape(title or "")
-                        + "</title></head><body>"
-                        + html.escape(page_text or "")
-                        + "</body></html>"
-                    ),
-                    status_code=200,
-                    title=title or "",
-                ),
-                links,
-            )
-        finally:
-            await context.close()
-            await browser.close()
-
-
-
 # ============================================================
 # OLD DOMAIN -> CURRENT DOMAIN
 # ============================================================
@@ -719,54 +422,25 @@ def extract_links(
 
 
 # ============================================================
-# FETCH PAGE
-#
-# Engine selection:
-#   - GDFlix          -> old curl_cffi method
-#   - BROWSER list    -> real browser + click method
-#   - everything else -> normal requests method
+# FETCH PAGE  (requests + Playwright fallback)
 # ============================================================
 
 from curl_cffi import requests as cffi_requests
 
-
-async def fetch_page(session, url):
-    if should_use_browser(url):
-        print("[BROWSER] Rendering/clicking:", url)
-        return await fetch_page_browser(url)
-
-    if should_use_gdflix(url):
-        print("[GDFlIX] Using curl_cffi:", url)
-        response = cffi_requests.get(
-            url,
-            impersonate="chrome",
-            timeout=25,
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-        return response, extract_links(response)
-
-    print("[HTTP] Using normal requests:", url)
-    response = session.get(
+def fetch_page(session, url):
+    # impersonate a real Chrome browser's TLS fingerprint
+    response = cffi_requests.get(
         url,
-        headers=HEADERS,
+        impersonate="chrome",
         timeout=25,
         allow_redirects=True,
     )
     response.raise_for_status()
 
-    return PageResult(
-        url=response.url,
-        text=response.text,
-        status_code=response.status_code,
-        title=(
-            BeautifulSoup(response.text, "html.parser").title.get_text(
-                " ", strip=True
-            )
-            if BeautifulSoup(response.text, "html.parser").title
-            else ""
-        ),
-    ), extract_links(response)
+    # curl_cffi response is compatible enough:
+    # response.text, response.url, response.status_code all work
+    links = extract_links(response)
+    return response, links
 
 
 # ============================================================
@@ -964,56 +638,6 @@ async def resolve_route(
     )
 
     # --------------------------------------------------------
-    # DIRECT-LINK ROUTE
-    # --------------------------------------------------------
-    # If direct_targets are configured, fetch the first page using
-    # its domain's selected engine and return the first matching link.
-    direct_targets = [
-        clean_domain(x)
-        for x in route.get("direct_targets", [])
-        if str(x).strip()
-    ]
-
-    if direct_targets:
-        response, links = await fetch_page(
-            session,
-            current_url
-        )
-
-        selected = None
-
-        for target in direct_targets:
-            if domain_matches(response.url, target):
-                selected = response.url
-                break
-
-            selected = find_target_link(
-                links,
-                [target]
-            )
-
-            if selected:
-                break
-
-        if selected is None:
-            raise RuntimeError(
-                "Direct route: none of these domains were found: "
-                + ", ".join(direct_targets)
-            )
-
-        return extract_final_url(
-            selected,
-            route.get("final")
-        ), [
-            {
-                "type": "direct",
-                "targets": direct_targets,
-                "input": current_url,
-                "selected": selected
-            }
-        ]
-
-    # --------------------------------------------------------
     # STEP LOOP
     # --------------------------------------------------------
 
@@ -1042,7 +666,7 @@ async def resolve_route(
         # Fetch current page
         # ----------------------------------------------------
 
-        response, links = await fetch_page(
+        response, links = fetch_page(
             session,
             current_url
         )
@@ -1124,7 +748,7 @@ async def resolve_route(
         current_url
     )
 
-    response, links = await fetch_page(
+    response, links = fetch_page(
         session,
         current_url
     )
@@ -1222,17 +846,20 @@ async def debug_page(
     )
 
     try:
+
         session = context.user_data.get(
             "session"
         )
 
         if session is None:
+
             session = requests.Session()
+
             context.user_data[
                 "session"
             ] = session
 
-        response, links = await fetch_page(
+        response, links = fetch_page(
             session,
             url
         )
@@ -1251,9 +878,10 @@ async def debug_page(
             "html.parser"
         )
 
-        title = response.title or "Unknown"
+        title = "Unknown"
 
         if soup.title:
+
             title = soup.title.get_text(
                 " ",
                 strip=True
@@ -1261,7 +889,8 @@ async def debug_page(
 
         message = (
             "✅ <b>Page fetched</b>\n\n"
-            f"<b>Status:</b> {response.status_code}\n\n"
+            f"<b>Status:</b> "
+            f"{response.status_code}\n\n"
             f"<b>Final URL:</b>\n"
             f"<code>{html.escape(response.url)}</code>\n\n"
             f"<b>Title:</b>\n"
@@ -1272,67 +901,20 @@ async def debug_page(
             links
         )
 
-        # Telegram limit workaround:
-        # normal-sized debug stays directly in Telegram.
-        # Only oversized debug output goes to Spacebin.
-        if len(message) <= TELEGRAM_SAFE_LIMIT:
-            await status.edit_text(
-                message,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            return
-
-        spacebin_url = upload_to_spacebin(
-            message
-        )
-
-        if spacebin_url:
-            compact = (
-                "✅ <b>Debug complete</b>\n\n"
-                f"<b>Status:</b> {response.status_code}\n"
-                f"<b>Links found:</b> {len(links)}\n\n"
-                "📄 <b>Full debug log is too large for Telegram.</b>\n"
-                "Open the Spacebin log below. The same link numbers "
-                "are stored here, so reply with a number to continue debugging."
-            )
-
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📄 Open full debug log",
-                        url=spacebin_url
-                    )
-                ]
-            ])
-
-            await status.edit_text(
-                compact,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-            return
-
-        # If Spacebin itself fails, keep Telegram usable by truncating.
-        fallback = (
-            message[:TELEGRAM_SAFE_LIMIT - 120]
-            + "\n\n⚠️ Full debug output was too large for Telegram "
-            "and Spacebin upload failed."
-        )
-
         await status.edit_text(
-            fallback,
+            message,
             parse_mode="HTML",
             disable_web_page_preview=True
         )
 
     except Exception as e:
+
         await status.edit_text(
             "❌ <b>Failed</b>\n\n"
             f"<code>{html.escape(str(e)[:1500])}</code>",
             parse_mode="HTML"
         )
+
 
 # ============================================================
 # AUTOMATIC RESOLVE
@@ -1450,15 +1032,31 @@ async def automatic_resolve(
                     "Resolver returned an empty URL."
                 )
 
-            # Normal resolver output stays in Telegram.
-            # Spacebin is used only for oversized /debug output.
-            keyboard = InlineKeyboardMarkup([
-                [
+            # ------------------------------------------------
+            # Create a Spacebin paste containing ONLY this
+            # final URL. Nothing else.
+            # ------------------------------------------------
+            individual_spacebin = upload_to_spacebin(
+                final_url
+            )
+
+            buttons = [
+                InlineKeyboardButton(
+                    "🔗 Open Link",
+                    url=final_url
+                )
+            ]
+
+            if individual_spacebin:
+                buttons.append(
                     InlineKeyboardButton(
-                        "🔗 Open Link",
-                        url=final_url
+                        "📄 Spacebin",
+                        url=individual_spacebin
                     )
-                ]
+                )
+
+            keyboard = InlineKeyboardMarkup([
+                buttons
             ])
 
             # ------------------------------------------------
@@ -1681,16 +1279,13 @@ async def start_command(
         "👋 <b>Multi-Step Link Bot</b>\n\n"
         "🐞 /debug — debug a link\n"
         "➕ /addroute — create route\n"
-        "🎯 /adddirect — direct target while creating\n"
         "✏️ /editroute — edit route\n"
         "📂 /routes — list routes\n"
         "🗑 /deleteroute — delete route\n"
         "❌ /cancel — cancel\n\n"
         "💡 <b>Normal mode:</b>\n"
         "Just send URL(s), one per line.\n"
-        "The bot automatically resolves them.\n\n"
-        "🌐 Browser/click sites are controlled by "
-        "BROWSER_FIRST_DOMAINS at the top of the code.",
+        "The bot automatically resolves them.",
         parse_mode="HTML"
     )
 
@@ -1762,7 +1357,6 @@ async def addroute_command(
         "new_route"
     ] = {
         "steps": [],
-        "direct_targets": [],
         "final": None
     }
 
@@ -1818,41 +1412,6 @@ async def addstep_command(
     )
 
 
-
-# ============================================================
-# /ADDDIRECT
-# ============================================================
-
-async def adddirect_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    route = context.user_data.get(
-        "new_route"
-    )
-
-    if not route:
-        await update.message.reply_text(
-            "❌ You are not creating a route.\n\n"
-            "Use /addroute first."
-        )
-        return
-
-    context.user_data[
-        "mode"
-    ] = "route_direct_target"
-
-    await update.message.reply_text(
-        "🎯 <b>Direct-link route</b>\n\n"
-        "Send target domain(s) that should be "
-        "found directly on the first page.\n\n"
-        "Example:\n"
-        "<code>cdn.example.com, mirror.example.net</code>",
-        parse_mode="HTML"
-    )
-
-
 # ============================================================
 # /ENDSTEP
 # ============================================================
@@ -1874,10 +1433,10 @@ async def endstep_command(
 
         return
 
-    if not route["steps"] and not route.get("direct_targets"):
+    if not route["steps"]:
 
         await update.message.reply_text(
-            "❌ Add at least one step or one direct target first."
+            "❌ Add at least one step first."
         )
 
         return
@@ -1965,17 +1524,6 @@ async def routes_command(
                 f"<code>{html.escape(', '.join(aliases))}</code>"
             )
 
-        direct_targets = route.get(
-            "direct_targets",
-            []
-        )
-
-        if direct_targets:
-            lines.append(
-                "Direct: "
-                f"<code>{html.escape(', '.join(direct_targets))}</code>"
-            )
-
         for number, step in enumerate(
             route.get(
                 "steps",
@@ -2046,10 +1594,6 @@ async def save_new_route(
             "steps",
             []
         ),
-        "direct_targets": route.get(
-            "direct_targets",
-            []
-        ),
         "final": route.get(
             "final"
         )
@@ -2066,9 +1610,6 @@ async def save_new_route(
         f"{html.escape(name)}",
         f"<b>Main:</b> "
         f"<code>{html.escape(str(route.get('main_domain')))}</code>",
-        "",
-        "<b>Direct targets:</b>",
-        f"<code>{html.escape(', '.join(route.get('direct_targets', [])) or 'None')}</code>",
         "",
         "<b>Steps:</b>"
     ]
@@ -2209,17 +1750,6 @@ async def show_edit_menu(
         f"{html.escape(route_name)}",
         ""
     ]
-
-    direct_targets = route.get(
-        "direct_targets",
-        []
-    )
-
-    if direct_targets:
-        lines.append(
-            "Direct: "
-            f"<code>{html.escape(', '.join(direct_targets))}</code>"
-        )
 
     for number, step in enumerate(
         route.get("steps", []),
@@ -2654,59 +2184,7 @@ async def handle_text(
 
         await update.message.reply_text(
             "✅ Main domain saved.\n\n"
-            "Use /addstep for a multi-step route.\n"
-            "Use /adddirect for a direct-link route.",
-            parse_mode="HTML"
-        )
-
-        return
-
-    # ========================================================
-    # ROUTE DIRECT TARGET
-    # ========================================================
-
-    if mode == "route_direct_target":
-
-        route = context.user_data[
-            "new_route"
-        ]
-
-        raw_domains = text.split(
-            ","
-        )
-
-        targets = []
-
-        for domain in raw_domains:
-            domain = clean_domain(domain)
-
-            if (
-                domain
-                and domain not in targets
-            ):
-                targets.append(
-                    domain
-                )
-
-        if not targets:
-            await update.message.reply_text(
-                "❌ No valid domains."
-            )
-            return
-
-        route[
-            "direct_targets"
-        ] = targets
-
-        context.user_data[
-            "mode"
-        ] = "route_menu"
-
-        await update.message.reply_text(
-            "✅ <b>Direct target(s) saved</b>\n\n"
-            f"<code>{html.escape(', '.join(targets))}</code>\n\n"
-            "Use /endstep when finished, or /addstep "
-            "to add multi-step targets too.",
+            "Now use /addstep to add Step 1.",
             parse_mode="HTML"
         )
 
@@ -3726,13 +3204,6 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "adddirect",
-            adddirect_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
             "endstep",
             endstep_command
         )
@@ -3814,7 +3285,8 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.Regex(r"^/i\d+(?:@\w+)?$"),
+            filters.COMMAND
+            & filters.Regex(r"^/i\d+(?:@\w+)?$"),
             compile_links_command
         )
     )
