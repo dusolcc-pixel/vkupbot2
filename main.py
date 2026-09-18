@@ -1449,6 +1449,118 @@ def fetch_page_http(url):
     )
 
 
+def fetch_page_requests(session, url):
+    """Legacy plain-requests fetch for HubCloud-style routes.
+
+    This intentionally never launches Playwright.
+    """
+    if session is None:
+        session = requests.Session()
+
+    response = session.get(
+        url,
+        headers=HEADERS,
+        timeout=25,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    links = extract_links_from_html(
+        response.url,
+        response.text,
+    )
+
+    title = ""
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+        if soup.title:
+            title = soup.title.get_text(" ", strip=True)
+    except Exception:
+        pass
+
+    return (
+        PageResult(
+            url=response.url,
+            text=response.text,
+            status_code=response.status_code,
+            title=title,
+        ),
+        links,
+    )
+
+
+def infer_route_engine(url, route=None):
+    """Resolve the configured engine while keeping older routes compatible.
+
+    Engines:
+      gdflix   -> curl_cffi legacy path
+      hubcloud -> normal requests legacy path
+      browser  -> Playwright rendered page
+      auto     -> infer gdflix/hubcloud, otherwise browser
+    """
+    route = route if isinstance(route, dict) else {}
+    engine = str(route.get("engine", "auto") or "auto").strip().lower()
+
+    aliases = {
+        "curl": "gdflix",
+        "curl_cffi": "gdflix",
+        "cffi": "gdflix",
+        "requests": "hubcloud",
+        "normal": "hubcloud",
+        "http": "hubcloud",
+        "playwright": "browser",
+        "real_browser": "browser",
+        "real-page": "browser",
+        "realpage": "browser",
+    }
+    engine = aliases.get(engine, engine)
+
+    if engine in {"gdflix", "hubcloud", "browser"}:
+        return engine
+
+    main_domain = clean_domain(route.get("main_domain", ""))
+    host = (urlparse(url).hostname or "").lower()
+
+    # For auto mode, inspect the CURRENT URL first. This allows a single
+    # route to move through legacy GDFlix -> HubCloud pages without forcing
+    # every step to use the same HTTP engine.
+    if "gdflix" in host:
+        return "gdflix"
+
+    if host.startswith("hubcloud."):
+        return "hubcloud"
+
+    # Fall back to the route's main domain only when the current URL itself
+    # does not identify a known legacy family.
+    if "gdflix" in main_domain:
+        return "gdflix"
+
+    if main_domain.startswith("hubcloud."):
+        return "hubcloud"
+
+    return "browser"
+
+
+async def fetch_page_for_route(session, url, route=None):
+    """Route-aware fetcher.
+
+    GDFlix and HubCloud keep their legacy fast paths. Only routes configured
+    for the browser, or unknown domains in auto mode, use Playwright.
+    """
+    engine = infer_route_engine(url, route)
+
+    if engine == "gdflix":
+        print("[ENGINE] GDFlix legacy (curl_cffi):", url)
+        return fetch_page_http(url)
+
+    if engine == "hubcloud":
+        print("[ENGINE] HubCloud legacy (requests):", url)
+        return fetch_page_requests(session, url)
+
+    print("[ENGINE] Real browser (Playwright):", url)
+    return await fetch_page_browser(url)
+
+
 async def fetch_page(session, url):
     """
     Generic fetcher.
@@ -1732,9 +1844,10 @@ route
             direct_targets
         )
 
-        response, links = await fetch_page(
+        response, links = await fetch_page_for_route(
             session,
-            current_url
+            current_url,
+            route,
         )
 
         print(
@@ -1815,9 +1928,10 @@ route
         # Fetch current page
         # ----------------------------------------------------
 
-        response, links = await fetch_page(
+        response, links = await fetch_page_for_route(
             session,
-            current_url
+            current_url,
+            route,
         )
 
         print(
@@ -1897,9 +2011,10 @@ route
         current_url
     )
 
-    response, links = await fetch_page(
+    response, links = await fetch_page_for_route(
         session,
-        current_url
+        current_url,
+        route,
     )
 
     print(
@@ -1973,8 +2088,15 @@ def format_debug_links(links, interactive=None):
 
 
 async def debug_page(update, context, url):
+    engine = infer_route_engine(url, {"engine": "auto"})
+    engine_label = {
+        "gdflix": "GDFlix fast mode",
+        "hubcloud": "HubCloud fast mode",
+        "browser": "real browser mode",
+    }.get(engine, engine)
+
     status = await update.message.reply_text(
-        "🔎 Opening page in Chromium and inspecting the live page...",
+        f"🔎 Debugging in {engine_label}...",
         disable_web_page_preview=True,
     )
 
@@ -1984,7 +2106,11 @@ async def debug_page(update, context, url):
             session = requests.Session()
             context.user_data["session"] = session
 
-        response, links = await fetch_page_browser(url)
+        response, links = await fetch_page_for_route(
+            session,
+            url,
+            {"engine": "auto"},
+        )
 
         context.user_data["debug_links"] = links
         context.user_data["debug_current_url"] = response.url
@@ -1997,7 +2123,7 @@ async def debug_page(update, context, url):
 
         title = response.title or "Unknown"
         message = (
-            "✅ <b>Browser page inspected</b>\n\n"
+            f"✅ <b>Page inspected ({html.escape(engine_label)})</b>\n\n"
             f"<b>Status:</b> {response.status_code}\n\n"
             f"<b>Final URL:</b>\n<code>{html.escape(response.url)}</code>\n\n"
             f"<b>Title:</b>\n{html.escape(title[:500])}\n\n"
@@ -2131,28 +2257,12 @@ urls
                     "Resolver returned an empty URL."
                 )
 
-            # ------------------------------------------------
-            # Create a Spacebin paste containing ONLY this
-            # final URL. Nothing else.
-            # ------------------------------------------------
-            individual_spacebin = upload_to_spacebin(
-                final_url
-            )
-
             buttons = [
                 InlineKeyboardButton(
                     "🔗 Open Link",
                     url=final_url
                 )
             ]
-
-            if individual_spacebin:
-                buttons.append(
-                    InlineKeyboardButton(
-                        "📄 Spacebin",
-                        url=individual_spacebin
-                    )
-                )
 
             keyboard = InlineKeyboardMarkup([
                 buttons
@@ -2463,6 +2573,7 @@ context: ContextTypes.DEFAULT_TYPE
     ] = {
         "steps": [],
         "direct_targets": [],
+        "engine": "auto",
         "final": {
             "type": "current_url"
         }
@@ -2657,6 +2768,18 @@ context: ContextTypes.DEFAULT_TYPE
                 f"<code>{html.escape(str(main))}</code>"
             )
 
+        engine = route.get("engine", "auto")
+        engine_labels = {
+            "gdflix": "GDFlix legacy",
+            "hubcloud": "HubCloud legacy",
+            "browser": "Real browser",
+            "auto": "Auto-detect",
+        }
+        lines.append(
+            "Engine: "
+            f"<code>{html.escape(engine_labels.get(str(engine), str(engine)))}</code>"
+        )
+
         aliases = route.get(
             "aliases",
             []
@@ -2763,6 +2886,10 @@ context
             "direct_targets",
             []
         ),
+        "engine": route.get(
+            "engine",
+            "auto"
+        ),
         "final": route.get(
             "final"
         )
@@ -2780,6 +2907,19 @@ context
         f"<b>Main:</b> "
         f"<code>{html.escape(str(route.get('main_domain')))}</code>"
     ]
+
+    engine = route.get("engine", "auto")
+    engine_labels = {
+        "gdflix": "GDFlix legacy",
+        "hubcloud": "HubCloud legacy",
+        "browser": "Real browser",
+        "auto": "Auto-detect",
+    }
+    lines.extend([
+        "",
+        "<b>Engine:</b>",
+        f"<code>{html.escape(engine_labels.get(str(engine), str(engine)))}</code>",
+    ])
 
     direct_targets = route.get(
         "direct_targets",
@@ -3373,14 +3513,60 @@ context: ContextTypes.DEFAULT_TYPE
 
         context.user_data[
             "mode"
-        ] = "route_menu"
+        ] = "route_engine"
 
         await update.message.reply_text(
             "✅ Main domain saved.\n\n"
-            "Now choose the route type:\n\n"
-            "🎯 /adddirect — desired link is already on the first page\n"
-            "➕ /addstep — the link needs one or more intermediate steps\n\n"
-            "Send /cancel to stop.",
+            "Choose the fetch method for this route:\n\n"
+            "<b>1</b> — GDFlix legacy (curl_cffi, fast)\n"
+            "<b>2</b> — HubCloud legacy (normal requests, fast)\n"
+            "<b>3</b> — Real browser (Playwright, for JS pages)\n"
+            "<b>4</b> — Auto-detect (old routes / mixed domains)\n\n"
+            "Reply with 1, 2, 3 or 4.",
+            parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # ROUTE ENGINE
+    # ========================================================
+
+    if mode == "route_engine":
+
+        route = context.user_data[
+            "new_route"
+        ]
+
+        engine_map = {
+            "1": "gdflix",
+            "2": "hubcloud",
+            "3": "browser",
+            "4": "auto",
+        }
+
+        engine = engine_map.get(text.strip())
+
+        if not engine:
+            await update.message.reply_text(
+                "❌ Reply with 1, 2, 3 or 4."
+            )
+            return
+
+        route["engine"] = engine
+        context.user_data["mode"] = "route_menu"
+
+        labels = {
+            "gdflix": "GDFlix legacy",
+            "hubcloud": "HubCloud legacy",
+            "browser": "Real browser",
+            "auto": "Auto-detect",
+        }
+
+        await update.message.reply_text(
+            f"✅ <b>Engine:</b> {html.escape(labels[engine])}\n\n"
+            "Now use /adddirect if the target is already on the first page, "
+            "or /addstep for a multi-step route.",
             parse_mode="HTML"
         )
 
