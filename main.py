@@ -302,6 +302,7 @@ class PageResult:
     text: str
     status_code: int = 200
     title: str = ""
+    interactive: list = None
 
 
 def normalize_link(base_url, value):
