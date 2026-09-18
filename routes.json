@@ -50,7 +50,7 @@
         }
     },
     "titancloud": {
-        "main_domab": "titancloud.site",
+        "main_domain": "titancloud.site",
         "steps": [],
         "direct_targets": [
             "workers.dev"
