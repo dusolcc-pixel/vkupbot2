@@ -36,7 +36,7 @@ BROWSER_FIRST_DOMAINS = {
 #     "members.example.com",
 #
 AUTH_BROWSER_DOMAINS = {
-    # "members.example.com",
+    # "mnmcloud.fun",
 }
 
 AUTH_STATE_DIR = os.getenv("AUTH_STATE_DIR", "auth_states").strip() or "auth_states"
