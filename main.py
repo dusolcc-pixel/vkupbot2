@@ -862,461 +862,29 @@ async def _click_useful_buttons(page, base_url, links, seen):
         except Exception as e:
             print("[BUTTON] Inspection error:", text[:100], e)
 async def fetch_page_browser(url):
-    """Render any website with Chromium and inspect its live page."""
-
-    if not PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError(
-            "Playwright Python package is not installed."
-        )
-
-    if not await ensure_playwright_browser():
-        raise RuntimeError(
-            "Playwright Chromium is not installed and could not be installed automatically."
-        )
-
-    captured_network_urls = []
-    network_seen = set()
-
-    async with async_playwright() as playwright:
-
-        browser = await playwright.chromium.launch(
-            headless=BROWSER_HEADLESS,
-        )
-
-        context = await browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={
-                "width": 1366,
-                "height": 768,
-            },
-            ignore_https_errors=True,
-            accept_downloads=True,
-        )
-
-        page = await context.new_page()
-
-        def capture_request(request):
-            try:
-                request_url = request.url
-
-                if (
-                    request_url.startswith(("http://", "https://"))
-                    and request_url not in network_seen
-                ):
-                    network_seen.add(request_url)
-                    captured_network_urls.append(request_url)
-            except Exception:
-                pass
-
-        page.on("request", capture_request)
-
-        response = None
-
-        try:
-            response = await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=BROWSER_TIMEOUT_MS,
-            )
-        except Exception as e:
-            print(
-                "[BROWSER GOTO ERROR]",
-                url,
-                e,
-            )
-
-        # Wait for client-side rendering.
-        try:
-            await page.wait_for_load_state(
-                "networkidle",
-                timeout=BROWSER_WAIT_MS,
-            )
-        except Exception:
-            pass
-
-        await page.wait_for_timeout(
-            min(BROWSER_WAIT_MS, 4_000)
-        )
-
-        current_url = page.url
-        rendered_html = await page.content()
-
-        try:
-            title = await page.title()
-        except Exception:
-            title = ""
-
-        # Primary result: everything actually represented in the rendered DOM.
-        links = extract_links_from_html(
-            current_url,
-            rendered_html,
-        )
-        seen = set(links)
-
-        # Add non-asset network requests. This catches JS-generated API/file URLs
-        # without flooding the output with every JS/CSS/image request.
-        for network_url in captured_network_urls:
-            _add_browser_url(
-                links,
-                seen,
-                network_url,
-            )
-
-        # Inspect download/mirror/server buttons and any links they reveal.
-        await _click_useful_buttons(
-            page,
-            current_url,
-            links,
-            seen,
-        )
-
-        await browser.close()
-
-        return (
-            PageResult(
-                url=current_url,
-                text=rendered_html,
-                status_code=(
-                    response.status
-                    if response is not None
-                    else 200
-                ),
-                title=title,
-            ),
-            links,
-        )
-
-
-# ============================================================
-# BROWSER DEBUG V2
-# ============================================================
-# This block is intentionally generic. It does not hard-code TitanCloud,
-# GDFlix, Amazon, or any other domain.
-#
-# Important difference from the old browser code:
-# - Do not treat every browser request as a useful link.
-# - Inspect the rendered DOM for visible anchors/buttons.
-# - For useful buttons, click them and capture navigation/popup/download
-#   request URLs plus URLs contained in API/JSON responses.
-# - Do not wait for or save a multi-GB media download. The request URL is
-#   captured before the file is downloaded.
-
-from dataclasses import dataclass, field
-from urllib.parse import urljoin
-
-
-@dataclass
-class PageResult:
-    url: str
-    text: str
-    status_code: int = 200
-    title: str = ""
-    interactive: list = field(default_factory=list)
-
-
-def _extract_urls_from_text(base_url, text):
-    """Extract HTTP(S) URLs from JSON/text returned by APIs or scripts."""
-    if not text:
-        return []
-
-    result = []
-    seen = set()
-
-    # Absolute URLs.
-    patterns = [
-        r'https?://[^\s\"\'<>\\]+',
-        r'(?i)(?:download|url|href|link|fileUrl|downloadUrl|directUrl|streamUrl)\s*[=:]\s*[\"\']([^\"\']+)',
-    ]
-
-    for pattern in patterns:
-        for match in re.findall(pattern, text):
-            values = match if isinstance(match, tuple) else [match]
-            for value in values:
-                value = str(value).strip().rstrip("'\"),;]}")
-                u = normalize_link(base_url, value)
-                if u and u not in seen:
-                    seen.add(u)
-                    result.append(u)
-
-    return result
-
-
-def _looks_like_download_response(url, headers):
-    """Return True for responses that are likely file/download results."""
-    h = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
-    ctype = h.get("content-type", "")
-    disp = h.get("content-disposition", "")
-    path = urlparse(url).path.lower()
-
-    if "attachment" in disp:
-        return True
-    if any(x in ctype for x in (
-        "video/", "audio/", "application/octet-stream",
-        "application/x-matroska", "application/vnd.apple.mpegurl",
-    )):
-        return True
-    if path.endswith((
-        ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm",
-        ".ts", ".m3u8", ".zip", ".rar", ".7z", ".pdf",
-    )):
-        return True
-    return False
-
-
-def _button_score(text):
-    """Rank likely link-producing controls without clicking dangerous actions."""
-    t = (text or "").strip().lower()
-    if not t:
-        return 0
-
-    blocked = (
-        "logout", "log out", "delete", "remove", "cancel",
-        "sign out", "unsubscribe", "close account", "checkout",
-        "purchase", "pay now", "login", "log in", "sign in",
-        "signup", "sign up", "register", "accept cookies",
-    )
-    if any(x in t for x in blocked):
-        return 0
-
-    score = 0
-    for word in (
-        "download", "direct", "mkv", "mp4", "avi", "mov", "webm",
-        "mirror", "server", "stream", "generate", "get link",
-        "get download", "file", "link", "1080", "720", "480", "360",
-        "2160", "1440",
-    ):
-        if word in t:
-            score += 1
-    return score
-
-
-async def _get_interactive_elements_v2(page):
-    """Return visible anchors/buttons and useful attributes from the live DOM."""
-    selector = (
-        "a, button, input[type=button], input[type=submit], "
-        "[role=button], [role=link]"
-    )
-    try:
-        return await page.locator(selector).evaluate_all(
-            """els => els.map((el, index) => {
-                const r = el.getBoundingClientRect();
-                const style = getComputedStyle(el);
-                const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
-                return {
-                    index,
-                    tag: el.tagName.toLowerCase(),
-                    text,
-                    href: el.getAttribute('href'),
-                    target: el.getAttribute('target'),
-                    download: el.getAttribute('download'),
-                    onclick: el.getAttribute('onclick'),
-                    dataHref: el.getAttribute('data-href'),
-                    dataUrl: el.getAttribute('data-url'),
-                    dataLink: el.getAttribute('data-link'),
-                    dataDownload: el.getAttribute('data-download'),
-                    dataTarget: el.getAttribute('data-target'),
-                    dataFile: el.getAttribute('data-file'),
-                    dataPath: el.getAttribute('data-path'),
-                    formaction: el.getAttribute('formaction'),
-                    visible: !!(r.width && r.height) && style.display !== 'none' && style.visibility !== 'hidden'
-                };
-            })"""
-        )
-    except Exception as e:
-        print("[BROWSER] Interactive scan error:", e)
-        return []
-
-
-async def _inspect_button_v2(page, item, base_url):
-    """Click one useful control and return URLs it causes without downloading files."""
-    text = (item.get("text") or "").strip()
-    if not _button_score(text):
-        return []
-
-    urls = []
-    seen = set()
-    responses = []
-    popup_pages = []
-
-    def add(u):
-        u = normalize_link(base_url, u)
-        if u and u not in seen and not _is_obvious_asset(u):
-            seen.add(u)
-            urls.append(u)
-
-    # First collect an href/data URL without clicking.
-    for key in (
-        "href", "dataHref", "dataUrl", "dataLink", "dataDownload",
-        "dataTarget", "dataFile", "dataPath", "formaction",
-    ):
-        value = item.get(key)
-        if value:
-            add(value)
-            for u in _extract_urls_from_text(base_url, str(value)):
-                add(u)
-
-    # We only click controls that are likely to produce a useful result.
-    # We do NOT use expect_download(), because that can make Playwright spool
-    # a multi-GB MKV into temporary storage. We capture the request URL instead.
-    selector = (
-        "a, button, input[type=button], input[type=submit], "
-        "[role=button], [role=link]"
-    )
-
-    try:
-        locator = page.locator(selector)
-        count = await locator.count()
-        element = None
-
-        # Prefer exact visible text after hydration.
-        for i in range(count):
-            candidate = locator.nth(i)
-            try:
-                if not await candidate.is_visible():
-                    continue
-                candidate_text = (await candidate.inner_text()).strip()
-                if not candidate_text:
-                    candidate_text = (await candidate.get_attribute("aria-label") or "").strip()
-                if candidate_text == text:
-                    element = candidate
-                    break
-            except Exception:
-                continue
-
-        if element is None:
-            index = item.get("index")
-            if isinstance(index, int) and index < count:
-                candidate = locator.nth(index)
-                if await candidate.is_visible():
-                    element = candidate
-
-        if element is None:
-            return urls
-
-        def capture_response(response):
-            try:
-                u = response.url
-                if u.startswith(("http://", "https://")):
-                    responses.append(response)
-            except Exception:
-                pass
-
-        page.on("response", capture_response)
-
-        # Reload the original page before each control. A previous button may
-        # have navigated or changed the DOM.
-        try:
-            await page.goto(
-                base_url,
-                wait_until="domcontentloaded",
-                timeout=BROWSER_TIMEOUT_MS,
-            )
-            try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1800)
-
-            # Re-find the element after hydration instead of using a stale
-            # locator from the previous DOM.
-            locator = page.locator(selector)
-            count = await locator.count()
-            element = None
-            for i in range(count):
-                candidate = locator.nth(i)
-                try:
-                    if not await candidate.is_visible():
-                        continue
-                    candidate_text = (await candidate.inner_text()).strip()
-                    if not candidate_text:
-                        candidate_text = (await candidate.get_attribute("aria-label") or "").strip()
-                    if candidate_text == text:
-                        element = candidate
-                        break
-                except Exception:
-                    continue
-            if element is None:
-                return urls
-        except Exception as e:
-            print("[BROWSER] Could not reload page for control:", text[:100], e)
-            return urls
-
-        try:
-            await element.scroll_into_view_if_needed(timeout=3000)
-        except Exception:
-            pass
-
-        try:
-            await element.click(timeout=7000, no_wait_after=True)
-        except Exception as e:
-            print("[BROWSER] Click failed:", text[:100], e)
-
-        await page.wait_for_timeout(3500)
-
-        # Current page navigation.
-        add(page.url)
-
-        # Process response bodies. This is the important part missing from the
-        # previous extractor: an API URL itself is not the desired link, but the
-        # JSON returned by that API may contain the desired link.
-        for response in list(responses):
-            try:
-                headers = await response.all_headers()
-                u = response.url
-                if _looks_like_download_response(u, headers):
-                    add(u)
-                ctype = (headers.get("content-type") or "").lower()
-                if "json" in ctype or "text" in ctype or "javascript" in ctype or "/api/" in u:
-                    body = await response.text()
-                    for found in _extract_urls_from_text(u, body):
-                        add(found)
-            except Exception:
-                continue
-
-        # Check newly opened pages/tabs.
-        try:
-            for p in page.context.pages:
-                if p is page:
-                    continue
-                if p not in popup_pages:
-                    popup_pages.append(p)
-        except Exception:
-            pass
-
-        for popup in popup_pages:
-            try:
-                await popup.wait_for_load_state("domcontentloaded", timeout=4000)
-            except Exception:
-                pass
-            add(popup.url)
-            try:
-                body = await popup.content()
-                for u in extract_links_from_html(popup.url, body):
-                    add(u)
-            except Exception:
-                pass
-
-        page.remove_listener("response", capture_response)
-
-    except Exception as e:
-        print("[BROWSER] Button inspection error:", text[:100], e)
-
-    return urls
-
-
-async def fetch_page_browser(url):
-    """Render a page in real Chromium and inspect its live interactive DOM."""
+    """Render the page in Chromium and inspect the *rendered* application.
+
+    This deliberately separates:
+      * ordinary links
+      * visible controls
+      * API/network traffic
+      * URLs produced by clicking a control
+
+    A site's API URL is not automatically reported as a download URL.  We
+    inspect the response body/headers and the browser result of the click.
+    """
     if not PLAYWRIGHT_AVAILABLE:
         raise RuntimeError("Playwright Python package is not installed.")
 
     if not await ensure_playwright_browser():
         raise RuntimeError(
-            "Playwright Chromium is not installed. "
-            "Install it in the Docker image."
+            "Playwright Chromium is not installed. Install it in the Docker image."
         )
 
-    network_urls = []
-    network_seen = set()
+    captured = []
+    captured_seen = set()
+    response_records = []
+    console_errors = []
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -1324,37 +892,67 @@ async def fetch_page_browser(url):
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
 
         context = await browser.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1366, "height": 768},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
             ignore_https_errors=True,
-            accept_downloads=False,
+            accept_downloads=True,
+            java_script_enabled=True,
         )
+
+        # Hide the most obvious automation flag. This is not intended to bypass
+        # authentication or access controls, only to make ordinary JS pages
+        # behave more like a normal browser session.
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
+
         page = await context.new_page()
 
-        def capture_request(request):
+        def add_network_url(u):
+            if not u or not u.startswith(("http://", "https://")):
+                return
+            if u not in captured_seen:
+                captured_seen.add(u)
+                captured.append(u)
+
+        def on_request(request):
+            add_network_url(request.url)
+
+        async def inspect_response(response):
             try:
-                u = request.url
+                u = response.url
                 if not u.startswith(("http://", "https://")):
                     return
-                # Only retain potentially useful requests here. Static resources,
-                # analytics and the site's own JS chunks are not debug links.
-                if _is_obvious_asset(u):
-                    return
-                if u not in network_seen:
-                    network_seen.add(u)
-                    network_urls.append(u)
+                headers = await response.all_headers()
+                ctype = (headers.get("content-type") or "").lower()
+                # Keep metadata for API/file responses. We don't save media bodies.
+                if "/api/" in u or "download" in u.lower() or "file" in u.lower():
+                    response_records.append((response, headers, ctype))
             except Exception:
                 pass
 
-        page.on("request", capture_request)
+        def on_response(response):
+            add_network_url(response.url)
+            asyncio.create_task(inspect_response(response))
 
-        response = None
+        def on_console(msg):
+            if msg.type == "error":
+                console_errors.append(msg.text[:500])
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("console", on_console)
+
+        main_response = None
         try:
-            response = await page.goto(
+            main_response = await page.goto(
                 url,
                 wait_until="domcontentloaded",
                 timeout=BROWSER_TIMEOUT_MS,
@@ -1362,12 +960,48 @@ async def fetch_page_browser(url):
         except Exception as e:
             print("[BROWSER GOTO ERROR]", url, e)
 
-        # Give React/Next/Vue/etc. time to hydrate and make API calls.
+        # Let the application hydrate. Some Next/React pages need substantially
+        # longer than networkidle because they keep a connection open.
+        for wait_ms in (2500, 3000):
+            try:
+                await page.wait_for_load_state("networkidle", timeout=wait_ms)
+            except Exception:
+                pass
+            await page.wait_for_timeout(wait_ms)
+
+        # If the page visibly says Retry, click Retry once. This is useful for
+        # apps whose first client-side API request occasionally fails. We do not
+        # click login/payment/delete/etc. controls automatically.
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            retry = page.get_by_role("button", name=re.compile(r"^retry$", re.I))
+            if await retry.count() and await retry.first.is_visible():
+                print("[BROWSER] Page exposed Retry; clicking it once...")
+                await retry.first.click(timeout=5000, no_wait_after=True)
+                await page.wait_for_timeout(4000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass
+        except Exception as e:
+            print("[BROWSER] Retry inspection failed:", e)
+
+        # Scroll through the page so lazy-rendered controls have a chance to
+        # appear. This does not download media.
+        try:
+            await page.evaluate("""
+                async () => {
+                    const step = Math.max(300, Math.floor(innerHeight * 0.75));
+                    for (let y = 0; y < document.body.scrollHeight; y += step) {
+                        window.scrollTo(0, y);
+                        await new Promise(r => setTimeout(r, 150));
+                    }
+                    window.scrollTo(0, 0);
+                }
+            """)
         except Exception:
             pass
-        await page.wait_for_timeout(2500)
+
+        await page.wait_for_timeout(1200)
 
         current_url = page.url
         rendered_html = await page.content()
@@ -1376,48 +1010,101 @@ async def fetch_page_browser(url):
         except Exception:
             title = ""
 
-        # Normal rendered links.
-        links = extract_links_from_html(current_url, rendered_html)
-        seen = set(links)
-        links = [u for u in links if not _is_obvious_asset(u)]
-        seen = set(links)
+        # Give pending response-body tasks a moment to finish.
+        await page.wait_for_timeout(800)
 
-        # Keep useful network URLs, but don't present every API call as if it
-        # were a download. We still keep file-like responses and non-obvious
-        # navigation URLs for debugging.
-        for u in network_urls:
-            _add_browser_url(links, seen, u)
+        links = []
+        seen = set()
 
-        # Visible interactive controls. This is separate from links so the user
-        # can see what a human sees on the page.
+        # Only ordinary rendered links initially. Do not flood the user's list
+        # with JS/CSS/analytics.
+        for u in extract_links_from_html(current_url, rendered_html):
+            if not _is_obvious_asset(u):
+                _add_browser_url(links, seen, u)
+
+        # Extract visible controls from the real rendered page.
         interactive = await _get_interactive_elements_v2(page)
         interactive = [
             x for x in interactive
             if x.get("visible") and (x.get("text") or x.get("href"))
         ]
 
-        # Click only likely link-producing controls. We intentionally limit this
-        # to 20 controls to avoid hammering a page with dozens of unrelated UI
-        # buttons.
+        # Also inspect same-origin iframes. A download button inside an iframe
+        # will never be found by querying only the top-level document.
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            try:
+                frame_items = await frame.locator(
+                    "a, button, input[type=button], input[type=submit], "
+                    "[role=button], [role=link]"
+                ).evaluate_all(
+                    """els => els.map((el,index) => ({
+                        index,
+                        tag: el.tagName.toLowerCase(),
+                        text: (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g,' ').trim(),
+                        href: el.getAttribute('href'),
+                        dataHref: el.getAttribute('data-href'),
+                        dataUrl: el.getAttribute('data-url'),
+                        dataLink: el.getAttribute('data-link'),
+                        dataDownload: el.getAttribute('data-download'),
+                        formaction: el.getAttribute('formaction'),
+                        visible: (() => { const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return !!(r.width&&r.height)&&s.display!=='none'&&s.visibility!=='hidden'; })()
+                    }))"""
+                )
+                for item in frame_items:
+                    if item.get("visible") and (item.get("text") or item.get("href")):
+                        item["frameUrl"] = frame.url
+                        interactive.append(item)
+            except Exception:
+                continue
+
+        # Build a small list of controls that actually look like file/link
+        # controls. Retry has already been handled separately.
         useful_controls = [
             x for x in interactive
             if _button_score(x.get("text", ""))
-        ][:20]
+        ][:30]
 
         for item in useful_controls:
             print("[BROWSER] Inspecting control:", item.get("text", "")[:120])
             for u in await _inspect_button_v2(page, item, current_url):
                 _add_browser_url(links, seen, u)
 
-        await browser.close()
+        # API response bodies can contain the generated URL even when the API
+        # request itself is not the download URL.
+        for response, headers, ctype in list(response_records):
+            try:
+                u = response.url
+                if _looks_like_download_response(u, headers):
+                    _add_browser_url(links, seen, u)
+                if "json" in ctype or "text" in ctype or "/api/" in u:
+                    body = await response.text()
+                    for found in _extract_urls_from_text(u, body):
+                        _add_browser_url(links, seen, found)
+            except Exception:
+                continue
 
-        return PageResult(
+        # Keep the browser's final navigation URL if it is different.
+        _add_browser_url(links, seen, current_url)
+
+        # Store diagnostic details on PageResult so /debug can explain why a
+        # page had no download control rather than silently falling back.
+        result = PageResult(
             url=current_url,
             text=rendered_html,
-            status_code=(response.status if response is not None else 200),
+            status_code=(main_response.status if main_response is not None else 200),
             title=title,
             interactive=interactive,
-        ), links
+        )
+        result.browser_diagnostics = {
+            "console_errors": console_errors[:20],
+            "network_count": len(captured),
+            "network_urls": captured[:200],
+        }
+
+        await browser.close()
+        return result, links
 
 # ============================================================
 # FETCH PAGE
