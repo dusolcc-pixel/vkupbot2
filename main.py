@@ -63,18 +63,34 @@ HEADERS = {
 
 # ============================================================
 
-SPACEBIN_API = "https://spaceb.in/api/"
+SPACEBIN_BASE_URL = os.getenv(
+    "SPACEBIN_BASE_URL",
+    "https://spaceb.in",
+).strip().rstrip("/")
+SPACEBIN_API = f"{SPACEBIN_BASE_URL}/api/"
+
+# Telegram text messages are limited to 4096 characters.
+# Keep a little headroom for HTML parsing and Telegram validation.
+TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_SAFE_LIMIT = 3900
 
 def upload_to_spacebin(content):
-    """Upload text to Spacebin and return its public URL."""
+    """Upload plain text to Spacebin and return its public document URL.
+
+    SPACEBIN_BASE_URL is the only setting you need, for example:
+      SPACEBIN_BASE_URL=https://spaceb.in
+    or a self-hosted instance:
+      SPACEBIN_BASE_URL=https://paste.example.com
+    """
 
     try:
         response = requests.post(
             SPACEBIN_API,
-            json={"content": content},
+            json={"content": str(content)},
             headers={
                 "User-Agent": HEADERS["User-Agent"],
                 "Content-Type": "application/json",
+                "Accept": "application/json",
             },
             timeout=30,
         )
@@ -85,16 +101,116 @@ def upload_to_spacebin(content):
         if data.get("error"):
             raise RuntimeError(str(data["error"]))
 
-        paste_id = (data.get("payload") or {}).get("id")
+        payload = data.get("payload") or {}
+        paste_url = payload.get("url") or data.get("url")
+        paste_id = payload.get("id")
+
+        if paste_url:
+            return str(paste_url)
 
         if not paste_id:
             raise RuntimeError("Spacebin did not return a paste ID.")
 
-        return f"https://spaceb.in/{paste_id}"
+        return f"{SPACEBIN_BASE_URL}/{paste_id}"
 
     except Exception as e:
-        print("[SPACEBIN ERROR]", e)
+        print("[SPACEBIN ERROR]", repr(e))
         return None
+
+def spacebin_plain_text(telegram_html):
+    """Convert our Telegram HTML message into readable plain text."""
+
+    try:
+        # BeautifulSoup is already a dependency of the bot.
+        raw = html.unescape(str(telegram_html))
+        soup = BeautifulSoup(raw, "html.parser")
+        text = soup.get_text("\n")
+        return text.strip()
+    except Exception:
+        # Conservative fallback if HTML parsing ever fails.
+        text = html.unescape(str(telegram_html))
+        text = re.sub(r"<[^>]+>", "", text)
+        return text.strip()
+
+async def send_or_spacebin_debug(update, message):
+    """Send a debug message normally, or store it in Spacebin when too long.
+
+    The full debug text is always preserved in Spacebin when Telegram would
+    reject the message. The numbered links remain in context.user_data, so
+    the user can still reply with a link number after opening the paste.
+    """
+
+    if len(message) <= TELEGRAM_SAFE_LIMIT:
+        return await update.message.reply_text(
+            message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    paste_text = spacebin_plain_text(message)
+    paste_url = upload_to_spacebin(paste_text)
+
+    if paste_url:
+        short_message = (
+            "📄 <b>Debug output is too long for Telegram.</b>\n\n"
+            "The complete output was uploaded to Spacebin.\n\n"
+            f"<a href=\"{html.escape(paste_url, quote=True)}\">"
+            "Open full debug output</a>\n\n"
+            "The numbered links are unchanged. Reply here with the "
+            "number you want to inspect."
+        )
+        return await update.message.reply_text(
+            short_message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    # Spacebin failed, so do not replace one error with another Telegram
+    # error. Send a safe truncated version instead.
+    fallback = message[:TELEGRAM_SAFE_LIMIT - 120] + (
+        "\n\n⚠️ <b>Output was truncated because Spacebin upload failed.</b>"
+    )
+    return await update.message.reply_text(
+        fallback,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+async def edit_or_spacebin_debug(status_message, message, context=None):
+    """Edit the debug status message, using Spacebin for oversized output."""
+
+    if len(message) <= TELEGRAM_SAFE_LIMIT:
+        return await status_message.edit_text(
+            message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    paste_text = spacebin_plain_text(message)
+    paste_url = upload_to_spacebin(paste_text)
+
+    if paste_url:
+        short_message = (
+            "📄 <b>Debug output is too long for Telegram.</b>\n\n"
+            f"<a href=\"{html.escape(paste_url, quote=True)}\">"
+            "Open full debug output</a>\n\n"
+            "The numbered links are unchanged. Reply with the number "
+            "you want to debug next."
+        )
+        return await status_message.edit_text(
+            short_message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    fallback = message[:TELEGRAM_SAFE_LIMIT - 120] + (
+        "\n\n⚠️ <b>Output was truncated because Spacebin upload failed.</b>"
+    )
+    return await status_message.edit_text(
+        fallback,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 # ============================================================
 
@@ -1814,11 +1930,7 @@ async def debug_page(update, context, url):
         )
         message += format_debug_links(links, interactive)
 
-        await status.edit_text(
-            message,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        await edit_or_spacebin_debug(status, message)
 
     except Exception as e:
         print("[DEBUG ERROR]", repr(e))
