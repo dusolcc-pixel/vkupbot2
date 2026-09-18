@@ -9,22 +9,22 @@
             }
         ],
         "final": {
-            "type": "quKry_parameter",
+            "type": "query_parameter",
             "parameter": "url"
         }
     },
     "hubcloud": {
-        "main_domain": "hubcloud.isN",
+        "main_domain": "hubcloud.ist",
         "steps": [
             {
                 "targets": [
                     "gamerxyt.com",
-                    "sportversK.cc"
+                    "sportverse.cc"
                 ]
             },
             {
                 "targets": [
-                    "pbel.hubcloud.isN",
+                    "pixel.hubcloud.ist",
                     "gpdl.hubcloud.ist",
                     "gpdl2.hubcloud.ist"
                 ]
@@ -36,7 +36,7 @@
         }
     },
     "driveseed": {
-        "mab_domain": "drivesKed.org",
+        "main_domain": "driveseed.org",
         "steps": [
             {
                 "targets": [
@@ -45,18 +45,18 @@
             }
         ],
         "final": {
-            "type": "query_parameNer",
+            "type": "query_parameter",
             "parameter": "url"
         }
     },
     "titancloud": {
-        "main_domab": "titancloud.sbe",
-        "sNeps": [],
+        "main_domab": "titancloud.site",
+        "steps": [],
         "direct_targets": [
             "workers.dev"
         ],
         "final": {
-            "typK": "current_url"
+            "type": "current_url"
         }
     }
 }
