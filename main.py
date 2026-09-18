@@ -4,15 +4,13 @@ import re
 import html
 import requests
 import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Browser configuration. This is intentionally NOT domain-specific.
 # Any website can be rendered in Chromium when the page needs JavaScript.
 BROWSER_TIMEOUT_MS = 30_000
 BROWSER_WAIT_MS = 6_000
 BROWSER_HEADLESS = True
-BROWSER_AUTO_INSTALL = True
+BROWSER_AUTO_INSTALL = False
 
 try:
     from playwright.async_api import async_playwright
@@ -40,10 +38,6 @@ filters,
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# Koyeb Web Service configuration. Koyeb provides PORT automatically.
-WEB_HOST = "0.0.0.0"
-WEB_PORT = int(os.getenv("PORT", "8000"))
 
 ROUTES_FILE = "routes.json"
 
@@ -571,7 +565,7 @@ async def ensure_playwright_browser():
         return True
 
     if not BROWSER_AUTO_INSTALL:
-        print("[BROWSER] Chromium is not installed.")
+        print("[BROWSER] Chromium must be installed by the Docker image.")
         return False
 
     print("[BROWSER] Chromium is missing. Installing it now...")
@@ -663,37 +657,6 @@ def _add_browser_url(links, seen, url):
         links.append(url)
 
 
-async def _extract_rendered_interactive_links(page, base_url, links, seen):
-    """Extract URLs from the live DOM, including React/Next.js attributes."""
-    try:
-        items = await page.locator(
-            "a, area, button, [role=link], [role=button], input[type=button], input[type=submit]"
-        ).evaluate_all(
-            """els => els.map(el => ({
-                text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
-                href: el.href || el.getAttribute('href'),
-                dataHref: el.getAttribute('data-href'),
-                dataUrl: el.getAttribute('data-url'),
-                dataLink: el.getAttribute('data-link'),
-                dataDownload: el.getAttribute('data-download'),
-                dataTarget: el.getAttribute('data-target'),
-                dataFile: el.getAttribute('data-file'),
-                formAction: el.getAttribute('formaction')
-            }))"""
-        )
-    except Exception:
-        return
-
-    for item in items:
-        for key in (
-            "href", "dataHref", "dataUrl", "dataLink",
-            "dataDownload", "dataTarget", "dataFile", "formAction"
-        ):
-            value = item.get(key)
-            if value:
-                _add_browser_url(links, seen, normalize_link(base_url, value))
-
-
 async def _get_visible_interactive_elements(page):
     """Return visible anchors/buttons and their useful attributes."""
 
@@ -743,141 +706,161 @@ def _button_should_be_clicked(text):
         "download", "direct", "mkv", "mp4", "avi", "mov", "webm",
         "mirror", "server", "stream", "1080", "720", "480", "360",
         "2160", "1440", "generate", "file", "link", "get link",
-        "continue", "next", "open", "view", "play",
     )
 
     return any(word in t for word in useful)
 
 
 async def _click_useful_buttons(page, base_url, links, seen):
-    """
-    Click visible download/mirror/server-style buttons one at a time.
-
-    The page is reloaded before each click so one button's navigation/state
-    does not prevent the next button from being inspected.
-    """
+    """Inspect visible download/mirror/server controls and observe their results."""
 
     elements = await _get_visible_interactive_elements(page)
+    items = [x for x in elements if _button_should_be_clicked(x.get("text", ""))]
 
-    button_items = [
-        item for item in elements
-        if item.get("tag") == "button"
-        and _button_should_be_clicked(item.get("text", ""))
-    ]
-
-    if not button_items:
+    if not items:
         return
 
-    print(
-        f"[BROWSER] Found {len(button_items)} useful button(s) to inspect."
-    )
+    print(f"[BROWSER] Found {len(items)} useful interactive element(s).")
 
-    for item in button_items:
-        text = item.get("text", "")
+    selector = "a, button, input[type=button], input[type=submit], [role=button]"
+
+    for item in items:
+        text = (item.get("text") or "").strip()
         index = item.get("index")
 
         try:
-            # Return to the original page before each independent click.
             await page.goto(
                 base_url,
                 wait_until="domcontentloaded",
                 timeout=BROWSER_TIMEOUT_MS,
             )
-
             try:
-                await page.wait_for_load_state(
-                    "networkidle",
-                    timeout=2_500,
-                )
+                await page.wait_for_load_state("networkidle", timeout=2500)
             except Exception:
                 pass
+            await page.wait_for_timeout(1200)
 
-            buttons = page.locator(
-                "a, button, input[type=button], input[type=submit], [role=button]"
-            )
+            elements_now = page.locator(selector)
+            count = await elements_now.count()
+            element = None
 
-            count = await buttons.count()
+            # Prefer matching visible text because hydration can change indexes.
+            for j in range(count):
+                candidate = elements_now.nth(j)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    candidate_text = (
+                        await candidate.inner_text()
+                        if await candidate.evaluate("(el) => !!el.innerText")
+                        else ""
+                    )
+                    candidate_text = (candidate_text or "").strip()
+                    if text and candidate_text == text:
+                        element = candidate
+                        break
+                except Exception:
+                    continue
 
-            if index is None or index >= count:
-                continue
+            if element is None and index is not None and index < count:
+                candidate = elements_now.nth(index)
+                if await candidate.is_visible():
+                    element = candidate
 
-            element = buttons.nth(index)
-
-            if not await element.is_visible():
+            if element is None:
                 continue
 
             print("[BUTTON] Inspecting:", text[:120])
 
-            # Capture the page's current network traffic during the click.
-            before_urls = set()
+            click_urls = set()
+            popup = None
+            download = None
 
-            async def request_handler(request):
-                request_url = request.url
-                if request_url.startswith(("http://", "https://")):
-                    before_urls.add(request_url)
+            def on_request(request):
+                u = request.url
+                if u.startswith(("http://", "https://")):
+                    click_urls.add(u)
 
-            page.on("request", request_handler)
+            def on_response(response):
+                try:
+                    u = response.url
+                    headers = {str(k).lower(): str(v).lower() for k, v in response.headers.items()}
+                    ctype = headers.get("content-type", "")
+                    disposition = headers.get("content-disposition", "")
+                    if u.startswith(("http://", "https://")) and (
+                        "attachment" in disposition
+                        or any(t in ctype for t in (
+                            "video/", "audio/", "application/octet-stream",
+                            "application/x-matroska", "application/vnd.apple.mpegurl",
+                        ))
+                    ):
+                        click_urls.add(u)
+                except Exception:
+                    pass
+
+            page.on("request", on_request)
+            page.on("response", on_response)
 
             try:
-                await element.click(
-                    timeout=5_000,
-                    no_wait_after=True,
-                )
-            except Exception as click_error:
-                print(
-                    "[BUTTON] Click failed:",
-                    text[:80],
-                    click_error,
-                )
+                try:
+                    async with page.expect_popup(timeout=3500) as popup_info:
+                        try:
+                            async with page.expect_download(timeout=3500) as download_info:
+                                await element.click(timeout=7000, no_wait_after=True)
+                                download = await download_info.value
+                        except Exception:
+                            await element.click(timeout=7000, no_wait_after=True)
+                    popup = await popup_info.value
+                except Exception:
+                    try:
+                        async with page.expect_download(timeout=3500) as download_info:
+                            await element.click(timeout=7000, no_wait_after=True)
+                            download = await download_info.value
+                    except Exception:
+                        await element.click(timeout=7000, no_wait_after=True)
+            except Exception as e:
+                print("[BUTTON] Click failed:", text[:100], e)
 
-            await page.wait_for_timeout(2_000)
+            await page.wait_for_timeout(2500)
 
-            # URL after click, if it navigated.
-            _add_browser_url(
-                links,
-                seen,
-                page.url,
-            )
+            _add_browser_url(links, seen, page.url)
 
-            # Network URLs caused by the click.
-            for request_url in before_urls:
-                _add_browser_url(
-                    links,
-                    seen,
-                    request_url,
-                )
+            if popup is not None:
+                try:
+                    await popup.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                _add_browser_url(links, seen, popup.url)
+                try:
+                    for u in extract_links_from_html(popup.url, await popup.content()):
+                        _add_browser_url(links, seen, u)
+                except Exception:
+                    pass
+                try:
+                    await popup.close()
+                except Exception:
+                    pass
 
-            # A click may create a modal/new link in the DOM.
+            if download is not None:
+                try:
+                    _add_browser_url(links, seen, download.url)
+                except Exception:
+                    pass
+
+            for u in click_urls:
+                _add_browser_url(links, seen, u)
+
             try:
-                new_html = await page.content()
-                for new_url in extract_links_from_html(
-                    page.url,
-                    new_html,
-                ):
-                    _add_browser_url(
-                        links,
-                        seen,
-                        new_url,
-                    )
+                for u in extract_links_from_html(page.url, await page.content()):
+                    _add_browser_url(links, seen, u)
             except Exception:
                 pass
 
-            try:
-                page.remove_listener(
-                    "request",
-                    request_handler,
-                )
-            except Exception:
-                pass
+            page.remove_listener("request", on_request)
+            page.remove_listener("response", on_response)
 
         except Exception as e:
-            print(
-                "[BUTTON] Inspection error:",
-                text[:80],
-                e,
-            )
-
-
+            print("[BUTTON] Inspection error:", text[:100], e)
 async def fetch_page_browser(url):
     """Render any website with Chromium and inspect its live page."""
 
@@ -892,7 +875,6 @@ async def fetch_page_browser(url):
         )
 
     captured_network_urls = []
-    captured_download_urls = []
     network_seen = set()
 
     async with async_playwright() as playwright:
@@ -908,7 +890,7 @@ async def fetch_page_browser(url):
                 "height": 768,
             },
             ignore_https_errors=True,
-            accept_downloads=False,
+            accept_downloads=True,
         )
 
         page = await context.new_page()
@@ -927,16 +909,6 @@ async def fetch_page_browser(url):
                 pass
 
         page.on("request", capture_request)
-
-        def capture_download(download):
-            try:
-                download_url = download.url
-                if download_url and download_url not in captured_download_urls:
-                    captured_download_urls.append(download_url)
-            except Exception:
-                pass
-
-        page.on("download", capture_download)
 
         response = None
 
@@ -990,14 +962,6 @@ async def fetch_page_browser(url):
                 network_url,
             )
 
-        # Inspect the final live DOM after JavaScript has rendered.
-        await _extract_rendered_interactive_links(
-            page,
-            current_url,
-            links,
-            seen,
-        )
-
         # Inspect download/mirror/server buttons and any links they reveal.
         await _click_useful_buttons(
             page,
@@ -1005,15 +969,6 @@ async def fetch_page_browser(url):
             links,
             seen,
         )
-
-        # Add direct browser download URLs, when a button triggered an
-        # actual download rather than a normal navigation.
-        for download_url in captured_download_urls:
-            _add_browser_url(
-                links,
-                seen,
-                download_url,
-            )
 
         await browser.close()
 
@@ -3851,72 +3806,44 @@ context: ContextTypes.DEFAULT_TYPE
 
 # ============================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
-    """Tiny HTTP server used by Koyeb health checks and external monitors."""
+def start_health_server():
+    """Start a tiny HTTP server for Koyeb health checks and uptime pings."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    def _send(self, status=200, body=b"OK\n", content_type="text/plain; charset=utf-8"):
-        try:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
+    port = int(os.getenv("PORT", "8000"))
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/", "/health", "/ping"):
+                body = b"OK"
+                self.send_response(200)
+            else:
+                body = b"Not Found"
+                self.send_response(404)
+
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
 
-    def do_GET(self):
-        if self.path in ("/", "/health", "/healthz"):
-            body = (
-                b"GDFlix Telegram Link Bot is running.\n"
-                b"Health: OK\n"
-            )
-            self._send(200, body)
+        def log_message(self, fmt, *args):
             return
 
-        if self.path == "/ping":
-            self._send(200, b"pong\n")
-            return
-
-        self._send(404, b"Not Found\n")
-
-    def log_message(self, format, *args):
-        # Keep Koyeb logs clean.
-        return
-
-
-def start_web_server():
-    """Start the lightweight Koyeb HTTP endpoint in a background thread."""
-    server = ThreadingHTTPServer(
-        (WEB_HOST, WEB_PORT),
-        HealthHandler,
-    )
-
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="koyeb-health-server",
-        daemon=True,
-    )
-    thread.start()
-
-    print(
-        f"Web server listening on {WEB_HOST}:{WEB_PORT}"
-    )
-    print(
-        "Health endpoints: /health and /ping"
-    )
-
-    return server
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"[WEB] Health server listening on port {port}")
+    server.serve_forever()
 
 
 def main():
 
-    if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "Put your Telegram bot token "
-            "in BOT_TOKEN first."
+            "BOT_TOKEN environment variable is missing. "
+            "Set BOT_TOKEN in Koyeb using your Secret."
         )
+
+    import threading
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     print(
         "=" * 60
@@ -4074,21 +4001,11 @@ def main():
         )
     )
 
-    # Start the HTTP endpoint before Telegram polling so Koyeb can
-    # immediately pass its TCP/HTTP health check.
-    web_server = start_web_server()
-
     print(
         "Bot is running..."
     )
 
-    try:
-        application.run_polling()
-    finally:
-        try:
-            web_server.shutdown()
-        except Exception:
-            pass
+    application.run_polling()
 
 # ============================================================
 
