@@ -58,5 +58,15 @@
         "final": {
             "type": "current_url"
         }
+    },
+    "mnmcloud": {
+        "main_domain": "mnmcloud.fun",
+        "steps": [],
+        "direct_targets": [
+            "workers.dev"
+        ],
+        "final": {
+            "type": "current_url"
+        }
     }
 }
