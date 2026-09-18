@@ -1,0 +1,52 @@
+{
+    "gdflix": {
+        "main_domain": "new3.gdflix.io",
+        "steps": [
+            {
+                "targets": [
+                    "instant.busycdn.xyz"
+                ]
+            }
+        ],
+        "final": {
+            "type": "query_parameter",
+            "parameter": "url"
+        }
+    },
+    "hubcloud": {
+        "main_domain": "hubcloud.ist",
+        "steps": [
+            {
+                "targets": [
+                    "gamerxyt.com",
+                    "sportverse.cc"
+                ]
+            },
+            {
+                "targets": [
+                    "pixel.hubcloud.ist",
+                    "gpdl.hubcloud.ist",
+                    "gpdl2.hubcloud.ist"
+                ]
+            }
+        ],
+        "final": {
+            "type": "query_parameter",
+            "parameter": "link"
+        }
+    },
+    "driveseed": {
+        "main_domain": "driveseed.org",
+        "steps": [
+            {
+                "targets": [
+                    "cdn.video-gen.xyz"
+                ]
+            }
+        ],
+        "final": {
+            "type": "query_parameter",
+            "parameter": "url"
+        }
+    }
+}
