@@ -42,7 +42,7 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = ""
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 ROUTES_FILE = "routes.json"
 
