@@ -23,6 +23,24 @@ BROWSER_FIRST_DOMAINS = {
     # "examplecloud.com",
 }
 
+# ============================================================
+# REAL BROWSER SITES THAT REQUIRE A PERSISTENT LOGIN SESSION
+# ============================================================
+#
+# Add domains here when the site requires a one-time login (for
+# example, Login with Telegram) before its real links/content are
+# visible. The bot loads a Playwright storage_state JSON file for
+# that domain.
+#
+# Example:
+#     "members.example.com",
+#
+AUTH_BROWSER_DOMAINS = {
+    # "members.example.com",
+}
+
+AUTH_STATE_DIR = os.getenv("AUTH_STATE_DIR", "auth_states").strip() or "auth_states"
+
 # GDFlix keeps the old fast curl_cffi method.
 # Add new GDFlix mirrors here if they do not already contain
 # the word "gdflix" in their hostname.
@@ -310,7 +328,29 @@ def domain_in_list(url, domains):
 
 
 def should_use_browser(url):
-    return domain_in_list(url, BROWSER_FIRST_DOMAINS)
+    return (
+        domain_in_list(url, BROWSER_FIRST_DOMAINS)
+        or domain_in_list(url, AUTH_BROWSER_DOMAINS)
+    )
+
+
+def requires_auth_browser(url):
+    return domain_in_list(url, AUTH_BROWSER_DOMAINS)
+
+
+def auth_state_path(url):
+    """Return the per-domain Playwright storage-state path."""
+    host = hostname_of(url)
+    if not host:
+        return None
+    os.makedirs(AUTH_STATE_DIR, exist_ok=True)
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "_", host)
+    return os.path.join(AUTH_STATE_DIR, f"{safe_host}.json")
+
+
+def auth_state_exists(url):
+    path = auth_state_path(url)
+    return bool(path and os.path.isfile(path))
 
 
 def should_use_gdflix(url):
@@ -536,14 +576,28 @@ async def fetch_page_browser(url):
             ],
         )
 
-        context = await browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            timezone_id="Asia/Kolkata",
-            ignore_https_errors=True,
-            accept_downloads=True,
-        )
+        context_kwargs = {
+            "user_agent": HEADERS["User-Agent"],
+            "viewport": {"width": 1366, "height": 768},
+            "locale": "en-US",
+            "timezone_id": "Asia/Kolkata",
+            "ignore_https_errors": True,
+            "accept_downloads": True,
+        }
+
+        # Authenticated browser domains reuse the saved Playwright
+        # storage state created by auth_setup.py. We deliberately do
+        # not overwrite this file automatically, because an expired
+        # login must not destroy a still-valid backup state.
+        if requires_auth_browser(url):
+            state_path = auth_state_path(url)
+            if state_path and os.path.isfile(state_path):
+                context_kwargs["storage_state"] = state_path
+                print("[BROWSER AUTH] Using saved session:", state_path)
+            else:
+                print("[BROWSER AUTH] No saved session for:", hostname_of(url))
+
+        context = await browser.new_context(**context_kwargs)
 
         page = await context.new_page()
         try:
@@ -558,6 +612,16 @@ async def fetch_page_browser(url):
                 pass
 
             await page.wait_for_timeout(BROWSER_WAIT_MS)
+
+            # Authenticated sites may still open successfully but show their
+            # login wall when no saved session is available. Keep debugging
+            # usable and make the missing-session reason explicit.
+            if requires_auth_browser(url) and not auth_state_exists(url):
+                print(
+                    "[BROWSER AUTH] Authentication state missing for ",
+                    hostname_of(url),
+                    " - run auth_setup.py locally first."
+                )
 
             # Trigger lazy-rendered controls.
             try:
@@ -1693,6 +1757,46 @@ async def compile_links_command(
 
 
 # ============================================================
+# /AUTHSTATUS
+# ============================================================
+
+async def authstatus_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not AUTH_BROWSER_DOMAINS:
+        await update.message.reply_text(
+            "🔐 No authenticated browser domains are configured.\n\n"
+            "Add a domain to AUTH_BROWSER_DOMAINS at the top of the code."
+        )
+        return
+
+    lines = [
+        "🔐 <b>Authenticated browser sessions</b>",
+        ""
+    ]
+
+    for domain in sorted(AUTH_BROWSER_DOMAINS):
+        state_path = auth_state_path("https://" + clean_domain(domain) + "/")
+        if state_path and os.path.isfile(state_path):
+            lines.append(f"✅ <code>{html.escape(domain)}</code> — session found")
+        else:
+            lines.append(f"❌ <code>{html.escape(domain)}</code> — no session")
+
+    lines.extend([
+        "",
+        "Create a session locally with <code>auth_setup.py</code>, then place the generated JSON in:",
+        f"<code>{html.escape(AUTH_STATE_DIR)}/</code>"
+    ])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML"
+    )
+
+
+# ============================================================
 # /START
 # ============================================================
 
@@ -1714,6 +1818,7 @@ async def start_command(
         "🎯 /adddirect — direct target while creating\n"
         "✏️ /editroute — edit route\n"
         "📂 /routes — list routes\n"
+        "🔐 /authstatus — check login sessions\n"
         "🗑 /deleteroute — delete route\n"
         "❌ /cancel — cancel\n\n"
         "💡 <b>Normal mode:</b>\n"
@@ -3788,6 +3893,13 @@ def main():
         CommandHandler(
             "debug",
             debug_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "authstatus",
+            authstatus_command
         )
     )
 
