@@ -51,6 +51,8 @@ except ImportError:
 
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -3684,6 +3686,54 @@ async def editmenu_command(
         )
 
 
+
+
+# ============================================================
+# KOYEB HEALTH CHECK SERVER
+# ============================================================
+
+HEALTH_PORT = int(os.getenv("PORT", "8000"))
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+
+        if path in ("/", "/health", "/ping"):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        body = b"Not Found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # Keep Koyeb logs quiet unless you are debugging health requests.
+        return
+
+
+def start_health_server():
+    server = ThreadingHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="health-server",
+        daemon=True,
+    )
+    thread.start()
+    print(f"Web server listening on 0.0.0.0:{HEALTH_PORT}")
+    print("Health endpoints: /health and /ping")
+    return server
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -3714,6 +3764,8 @@ def main():
     print(
         f"Loaded {len(routes)} route(s)."
     )
+
+    start_health_server()
 
     application = (
         Application.builder()
