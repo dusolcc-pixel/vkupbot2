@@ -658,29 +658,49 @@ def _add_browser_url(links, seen, url):
 
 
 async def _get_visible_interactive_elements(page):
-    """Return visible anchors/buttons and their useful attributes."""
-
+    """Return visible interactive elements from the rendered page."""
     try:
         return await page.locator(
             "a, button, input[type=button], input[type=submit], "
-            "[role=button]"
+            "[role=button], [role=link]"
         ).evaluate_all(
-            """els => els.map((el, i) => ({
-                index: i,
-                tag: el.tagName.toLowerCase(),
-                text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
-                href: el.getAttribute('href'),
-                onclick: el.getAttribute('onclick'),
-                dataHref: el.getAttribute('data-href'),
-                dataUrl: el.getAttribute('data-url'),
-                dataLink: el.getAttribute('data-link'),
-                dataDownload: el.getAttribute('data-download'),
-                dataTarget: el.getAttribute('data-target'),
-                formaction: el.getAttribute('formaction')
-            }))"""
+            """els => els.map((el, i) => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                const visible = !!(
+                    r.width > 0 && r.height > 0 &&
+                    s.display !== 'none' &&
+                    s.visibility !== 'hidden' &&
+                    parseFloat(s.opacity || '1') > 0
+                );
+                return {
+                    index: i,
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role'),
+                    text: (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim(),
+                    href: el.href || el.getAttribute('href'),
+                    onclick: el.getAttribute('onclick'),
+                    dataHref: el.getAttribute('data-href'),
+                    dataUrl: el.getAttribute('data-url'),
+                    dataLink: el.getAttribute('data-link'),
+                    dataDownload: el.getAttribute('data-download'),
+                    dataTarget: el.getAttribute('data-target'),
+                    formaction: el.getAttribute('formaction'),
+                    target: el.getAttribute('target'),
+                    download: el.getAttribute('download'),
+                    visible: visible
+                };
+            })"""
         )
-    except Exception:
+    except Exception as e:
+        print('[BROWSER] Interactive element inspection failed:', e)
         return []
+
+
+# Compatibility alias used by the enhanced browser debugger.
+# Keep this alias so older helper calls do not break.
+async def _get_interactive_elements_v2(page):
+    return await _get_visible_interactive_elements(page)
 
 
 def _button_should_be_clicked(text):
