@@ -1,0 +1,7 @@
+beautifulsoup4
+curl_cffi
+feedparser
+playwright
+python-telegram-bot
+Requests
+telethon
