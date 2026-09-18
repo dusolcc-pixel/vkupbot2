@@ -731,6 +731,177 @@ def _button_should_be_clicked(text):
     return any(word in t for word in useful)
 
 
+
+def _button_score(text):
+    """Score visible controls by how likely they are to produce a useful file/link URL."""
+    t = (text or "").strip().lower()
+    if not t:
+        return 0
+    blocked = ("logout", "log out", "delete", "remove", "cancel", "unsubscribe",
+               "close account", "checkout", "purchase", "pay now", "login",
+               "log in", "sign in", "signup", "sign up")
+    if any(x in t for x in blocked):
+        return 0
+    score = 0
+    for word, points in (
+        ("download", 10), ("direct", 8), ("mkv", 12), ("mp4", 12),
+        ("avi", 10), ("mov", 10), ("webm", 10), ("mirror", 8),
+        ("server", 7), ("stream", 5), ("2160", 5), ("1440", 5),
+        ("1080", 5), ("720", 5), ("480", 5), ("360", 5),
+        ("generate", 6), ("file", 4), ("link", 5), ("get link", 8),
+    ):
+        if word in t:
+            score += points
+    return score
+
+
+def _looks_like_download_response(url, headers):
+    """Return True for responses that look like actual downloadable content."""
+    u = (url or "").lower()
+    h = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+    ct = h.get("content-type", "")
+    cd = h.get("content-disposition", "")
+    path = urlparse(u).path
+    return (
+        "attachment" in cd or
+        any(x in ct for x in ("video/", "audio/", "application/octet-stream",
+                              "application/x-matroska", "application/vnd.apple.mpegurl")) or
+        bool(re.search(r"\.(mkv|mp4|avi|mov|webm|m3u8|mpd)(?:$|[?#])", path))
+    )
+
+
+def _extract_urls_from_text(base_url, text):
+    """Extract absolute URLs from JSON/HTML/JS response text, including escaped URLs."""
+    if not text:
+        return []
+    out = []
+    seen = set()
+    # Normal and JSON/JS escaped HTTP URLs.
+    pattern = r'https?://[^\s"\'<>\\]+(?:\\/[^\s"\'<>\\]*)*'
+    for raw in re.findall(pattern, text, flags=re.I):
+        u = raw.replace(r'\/', '/').replace('\\u0026', '&').replace('\\u003d', '=')
+        u = u.rstrip('.,;)]}')
+        try:
+            u = normalize_link(base_url, u)
+        except Exception:
+            continue
+        if valid_url(u) and u not in seen and not _is_obvious_asset(u):
+            seen.add(u)
+            out.append(u)
+    # Also inspect common URL-valued JSON fields, including relative URLs.
+    try:
+        obj = json.loads(text)
+        def walk(v):
+            if isinstance(v, dict):
+                for k, val in v.items():
+                    if isinstance(val, str) and ("url" in str(k).lower() or "link" in str(k).lower() or "download" in str(k).lower()):
+                        try:
+                            u = normalize_link(base_url, val)
+                            if valid_url(u) and u not in seen and not _is_obvious_asset(u):
+                                seen.add(u); out.append(u)
+                        except Exception:
+                            pass
+                    walk(val)
+            elif isinstance(v, list):
+                for val in v: walk(val)
+        walk(obj)
+    except Exception:
+        pass
+    return out
+
+
+async def _inspect_button_v2(page, item, base_url):
+    """Click one rendered control and return URLs produced by the interaction."""
+    results = []
+    seen = set()
+    text = (item.get("text") or "").strip()
+    selector = "a, button, input[type=button], input[type=submit], [role=button], [role=link]"
+    try:
+        locator = page.locator(selector)
+        count = await locator.count()
+        target = None
+        wanted_index = item.get("index")
+        for i in range(count):
+            el = locator.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                et = (await el.inner_text()).strip()
+                if text and et == text:
+                    target = el
+                    break
+            except Exception:
+                continue
+        if target is None and isinstance(wanted_index, int) and wanted_index < count:
+            target = locator.nth(wanted_index)
+        if target is None:
+            return results
+
+        def add(u):
+            if u and u.startswith(("http://", "https://")) and not _is_obvious_asset(u) and u not in seen:
+                seen.add(u); results.append(u)
+
+        before = page.url
+        popup_holder = {"page": None}
+        request_urls = set()
+
+        def on_request(req):
+            if req.url.startswith(("http://", "https://")):
+                request_urls.add(req.url)
+
+        async def capture_download():
+            pass
+
+        page.on("request", on_request)
+        try:
+            try:
+                async with page.expect_popup(timeout=3000) as pop_info:
+                    try:
+                        async with page.expect_download(timeout=3000) as dl_info:
+                            await target.click(timeout=7000, no_wait_after=True)
+                            dl = await dl_info.value
+                            add(dl.url)
+                    except Exception:
+                        await target.click(timeout=7000, no_wait_after=True)
+                popup_holder["page"] = await pop_info.value
+            except Exception:
+                try:
+                    async with page.expect_download(timeout=3000) as dl_info:
+                        await target.click(timeout=7000, no_wait_after=True)
+                        dl = await dl_info.value
+                        add(dl.url)
+                except Exception:
+                    await target.click(timeout=7000, no_wait_after=True)
+        except Exception:
+            pass
+        finally:
+            page.remove_listener("request", on_request)
+
+        await page.wait_for_timeout(2500)
+        add(page.url)
+        for u in request_urls:
+            if _looks_like_download_response(u, {}):
+                add(u)
+        popup = popup_holder.get("page")
+        if popup:
+            try:
+                await popup.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            add(popup.url)
+            try:
+                body = await popup.content()
+                for u in extract_links_from_html(popup.url, body): add(u)
+            except Exception: pass
+            try: await popup.close()
+            except Exception: pass
+        if page.url != before:
+            add(page.url)
+    except Exception as e:
+        print("[BUTTON] inspection error:", text[:100], e)
+    return results
+
+
 async def _click_useful_buttons(page, base_url, links, seen):
     """Inspect visible download/mirror/server controls and observe their results."""
 
