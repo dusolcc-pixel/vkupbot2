@@ -414,41 +414,119 @@ def _extract_urls_from_text(value):
     return found
 
 
+def _normalize_dynamic_url(value):
+    """Normalize URLs embedded in JS/HTML/JSON escaped strings."""
+    if value is None:
+        return ""
+
+    value = html.unescape(str(value)).strip()
+
+    # Common JavaScript/JSON escaping.
+    value = value.replace('\\/', '/')
+    value = value.replace('\\u0026', '&')
+    value = value.replace('\\u003d', '=')
+    value = value.replace('\\u003f', '?')
+    value = value.replace('\\u002f', '/')
+
+    return value
+
+
+def _extract_urls_from_text(value):
+    """Extract absolute HTTP(S) URLs, including JS/HTML escaped URLs."""
+    if not value:
+        return []
+
+    text = _normalize_dynamic_url(value)
+    found = []
+
+    # Standard URLs.
+    patterns = [
+        r'https?://[^\s\'"<>\\]+',
+        # Specifically catch an encoded/escaped Googleusercontent URL even
+        # when punctuation immediately follows it.
+        r'https?://video-downloads\.googleusercontent\.com/[^\s\'"<>\\]+',
+    ]
+
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            cleaned = _normalize_dynamic_url(match).rstrip('\'"`);]},>.')
+            if valid_url(cleaned) and cleaned not in found:
+                found.append(cleaned)
+
+    return found
+
+
 async def _collect_rendered_urls(page, base_url):
-    """Collect URLs that exist only after JavaScript renders/updates the DOM."""
-    values = []
+    """Collect URLs created by JavaScript in the DOM, attributes, or frames."""
+    found = []
 
-    try:
-        rendered = await page.evaluate(
-            """() => {
-                const values = [];
+    async def collect_from_page(target_page, target_base_url):
+        try:
+            rendered = await target_page.evaluate(
+                """() => {
+                    const values = [];
 
-                // Visible text plus the complete DOM can contain a generated
-                // URL even when there is no <a href> to copy.
-                values.push(document.body ? document.body.innerText : "");
-                values.push(document.documentElement ? document.documentElement.outerHTML : "");
+                    values.push(document.body ? document.body.innerText : "");
+                    values.push(document.documentElement ? document.documentElement.outerHTML : "");
 
-                // Also inspect form/control values. Generated download URLs
-                // are commonly placed in an input/textarea after a button click.
-                for (const el of document.querySelectorAll('input, textarea, [contenteditable="true"]')) {
-                    values.push(el.value || "");
-                    values.push(el.textContent || "");
-                }
+                    // Inspect every attribute because many JS downloaders keep
+                    // the generated URL in data-* or onclick rather than href.
+                    for (const el of document.querySelectorAll('*')) {
+                        for (const attr of Array.from(el.attributes || [])) {
+                            values.push(attr.value || "");
+                        }
+                    }
 
-                return values;
-            }"""
-        )
+                    // Inputs/textareas/contenteditable elements are common
+                    // places for a generated URL to appear after clicking.
+                    for (const el of document.querySelectorAll('input, textarea, [contenteditable="true"]')) {
+                        values.push(el.value || "");
+                        values.push(el.textContent || "");
+                    }
 
-        for value in rendered or []:
-            for url in _extract_urls_from_text(value):
-                url = urljoin(base_url, url)
-                if valid_url(url) and not _browser_asset(url) and url not in values:
-                    values.append(url)
+                    return values;
+                }"""
+            )
 
-    except Exception as e:
-        print("[BROWSER DOM URL ERROR]", e)
+            for value in rendered or []:
+                for url in _extract_urls_from_text(value):
+                    url = urljoin(target_base_url, url)
+                    if valid_url(url) and not _browser_asset(url) and url not in found:
+                        found.append(url)
 
-    return values
+        except Exception as e:
+            print("[BROWSER DOM URL ERROR]", e)
+
+    await collect_from_page(page, base_url)
+
+    # The generator may render its result inside an iframe.
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            rendered = await frame.evaluate(
+                """() => {
+                    const values = [];
+                    values.push(document.body ? document.body.innerText : "");
+                    values.push(document.documentElement ? document.documentElement.outerHTML : "");
+                    for (const el of document.querySelectorAll('*')) {
+                        for (const attr of Array.from(el.attributes || [])) {
+                            values.push(attr.value || "");
+                        }
+                    }
+                    return values;
+                }"""
+            )
+            frame_url = frame.url or base_url
+            for value in rendered or []:
+                for url in _extract_urls_from_text(value):
+                    url = urljoin(frame_url, url)
+                    if valid_url(url) and not _browser_asset(url) and url not in found:
+                        found.append(url)
+        except Exception as e:
+            print("[BROWSER FRAME URL ERROR]", e)
+
+    return found
 
 
 def _browser_useful_text(text):
@@ -539,13 +617,17 @@ async def _click_browser_controls(page, base_url):
     # We inspect a bounded number of useful visible controls. Each click is
     # isolated by reloading the page, so one control cannot destroy the next.
     controls = await page.locator(
-        'button, [role="button"], input[type="button"], input[type="submit"], a'
+        'button, [role="button"], input[type="button"], input[type="submit"], a, [onclick], [data-href], [data-url], [data-link]'
     ).evaluate_all(
         """els => els.map((el, i) => ({
             i,
             tag: el.tagName,
             text: (el.innerText || el.textContent || el.value || "").trim(),
             href: el.href || "",
+            onclick: el.getAttribute("onclick") || "",
+            dataHref: el.getAttribute("data-href") || "",
+            dataUrl: el.getAttribute("data-url") || "",
+            dataLink: el.getAttribute("data-link") || "",
             visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
         })).filter(x => x.visible && x.text)"""
     )
@@ -577,9 +659,13 @@ async def _click_browser_controls(page, base_url):
             )
             await page.wait_for_timeout(min(BROWSER_WAIT_MS, 4000))
 
-            target = page.locator(
-                'button, [role="button"], input[type="button"], input[type="submit"], a'
-            ).filter(has_text=item.get("text", ""))
+            click_selector = (
+                'button, [role="button"], input[type="button"], '
+                'input[type="submit"], a, [onclick], [data-href], [data-url], [data-link]'
+            )
+            target = page.locator(click_selector).filter(
+                has_text=item.get("text", "")
+            )
 
             if await target.count() == 0:
                 continue
@@ -770,6 +856,42 @@ async def fetch_page_browser(url):
         context = await browser.new_context(**context_kwargs)
 
         page = await context.new_page()
+
+        # Capture URLs created through window.open/clipboard by JavaScript
+        # before the site's scripts run. Some download generators never expose
+        # their URL through an <a href>, request, or download event.
+        try:
+            await page.add_init_script(
+                """() => {
+                    window.__mnm_generated_urls = [];
+
+                    const remember = (value) => {
+                        try {
+                            if (typeof value !== 'string') return;
+                            if (/^https?:\\/\\/video-downloads\\.googleusercontent\\.com\\//i.test(value)) {
+                                window.__mnm_generated_urls.push(value);
+                            }
+                        } catch (_) {}
+                    };
+
+                    const originalOpen = window.open;
+                    window.open = function(url, ...args) {
+                        remember(url);
+                        return originalOpen.call(this, url, ...args);
+                    };
+
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        const originalWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+                        navigator.clipboard.writeText = function(text) {
+                            remember(text);
+                            return originalWriteText(text);
+                        };
+                    }
+                }"""
+            )
+        except Exception as e:
+            print("[BROWSER INIT HOOK ERROR]", e)
+
         try:
             await page.goto(
                 url,
@@ -813,6 +935,28 @@ async def fetch_page_browser(url):
             for u in clicked:
                 if valid_url(u) and not _browser_asset(u) and u not in links:
                     links.append(u)
+
+            # Read URLs captured by JavaScript hooks such as window.open or
+            # navigator.clipboard.writeText on the final page.
+            try:
+                hook_urls = await page.evaluate("() => window.__mnm_generated_urls || []")
+                for u in hook_urls or []:
+                    for normalized in _extract_urls_from_text(u):
+                        if normalized not in links and not _browser_asset(normalized):
+                            links.insert(0, normalized)
+            except Exception as e:
+                print("[BROWSER HOOK READ ERROR]", e)
+
+            # Also inspect any pages opened during the click flow.
+            for extra_page in list(context.pages):
+                if extra_page == page:
+                    continue
+                try:
+                    for u in await _collect_rendered_urls(extra_page, extra_page.url or url):
+                        if valid_url(u) and not _browser_asset(u) and u not in links:
+                            links.insert(0, u)
+                except Exception as e:
+                    print("[BROWSER EXTRA PAGE ERROR]", e)
 
             # Preserve rendered page text so debug output is useful.
             page_text = await page.locator("body").inner_text()
