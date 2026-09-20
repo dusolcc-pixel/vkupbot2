@@ -59,14 +59,13 @@
             "type": "current_url"
         }
     },
-    "mnmcloud": {
+    "mnmcloud 2": {
         "main_domain": "mnmcloud.fun",
         "steps": [],
         "direct_targets": [
-            "workers.dev"
+            "video-downloads.googleusercontent.com"
         ],
         "final": {
             "type": "current_url"
         }
     }
-}
