@@ -60,6 +60,12 @@ BROWSER_WAIT_MS = 6_000
 BROWSER_HEADLESS = True
 TELEGRAM_SAFE_LIMIT = 3900
 
+# Dynamic download URLs that may only appear after a button is clicked.
+# MnMCloud currently exposes generated links on Googleusercontent.
+GENERATED_DOWNLOAD_DOMAINS = {
+    "video-downloads.googleusercontent.com",
+}
+
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
@@ -364,6 +370,23 @@ def should_use_gdflix(url):
     return GDFlIX_DOMAIN_MARKER in host
 
 
+def is_generated_download_url(url):
+    """Return True for known dynamically generated download URLs."""
+    if not valid_url(url):
+        return False
+
+    host = hostname_of(url)
+    if not host:
+        return False
+
+    for domain in GENERATED_DOWNLOAD_DOMAINS:
+        domain = clean_domain(domain)
+        if host == domain or host.endswith("." + domain):
+            return True
+
+    return False
+
+
 def _browser_asset(url):
     path = urlparse(url).path.lower()
     bad = (
@@ -371,7 +394,61 @@ def _browser_asset(url):
         ".webp", ".ico", ".woff", ".woff2", ".ttf", ".otf",
         "googletagmanager", "google-analytics", "_next/static"
     )
-    return any(x in path or x in url.lower() for x in bad)
+    return (
+        not is_generated_download_url(url)
+        and any(x in path or x in url.lower() for x in bad)
+    )
+
+
+def _extract_urls_from_text(value):
+    """Extract absolute HTTP(S) URLs from rendered text/HTML/JS values."""
+    if not value:
+        return []
+
+    found = []
+    for match in re.findall(r'https?://[^\s\'"<>]+', str(value)):
+        cleaned = match.rstrip("\\'\"`);]},>")
+        if valid_url(cleaned) and cleaned not in found:
+            found.append(cleaned)
+
+    return found
+
+
+async def _collect_rendered_urls(page, base_url):
+    """Collect URLs that exist only after JavaScript renders/updates the DOM."""
+    values = []
+
+    try:
+        rendered = await page.evaluate(
+            """() => {
+                const values = [];
+
+                // Visible text plus the complete DOM can contain a generated
+                // URL even when there is no <a href> to copy.
+                values.push(document.body ? document.body.innerText : "");
+                values.push(document.documentElement ? document.documentElement.outerHTML : "");
+
+                // Also inspect form/control values. Generated download URLs
+                // are commonly placed in an input/textarea after a button click.
+                for (const el of document.querySelectorAll('input, textarea, [contenteditable="true"]')) {
+                    values.push(el.value || "");
+                    values.push(el.textContent || "");
+                }
+
+                return values;
+            }"""
+        )
+
+        for value in rendered or []:
+            for url in _extract_urls_from_text(value):
+                url = urljoin(base_url, url)
+                if valid_url(url) and not _browser_asset(url) and url not in values:
+                    values.append(url)
+
+    except Exception as e:
+        print("[BROWSER DOM URL ERROR]", e)
+
+    return values
 
 
 def _browser_useful_text(text):
@@ -446,11 +523,18 @@ async def _collect_browser_links(page, base_url):
             if valid_url(href) and not _browser_asset(href) and href not in links:
                 links.append(href)
 
+    # Important for JavaScript-only download buttons: the generated URL can
+    # be visible in an input/value or plain text without any href attribute.
+    for href in await _collect_rendered_urls(page, base_url):
+        if valid_url(href) and not _browser_asset(href) and href not in links:
+            links.append(href)
+
     return links
 
 
 async def _click_browser_controls(page, base_url):
     discovered = []
+    generated_first = []
 
     # We inspect a bounded number of useful visible controls. Each click is
     # isolated by reloading the page, so one control cannot destroy the next.
@@ -469,7 +553,20 @@ async def _click_browser_controls(page, base_url):
     useful = [
         x for x in controls
         if _browser_useful_text(x.get("text", ""))
-    ][:20]
+    ]
+
+    # A JavaScript-only generator button usually has no href at all.
+    # Put the explicit generator first so it is clicked before ordinary
+    # navigation/download controls.
+    useful.sort(
+        key=lambda x: (
+            0
+            if "generate download url" in x.get("text", "").lower()
+            or "generate download" in x.get("text", "").lower()
+            else 1
+        )
+    )
+    useful = useful[:20]
 
     for item in useful:
         try:
@@ -493,50 +590,111 @@ async def _click_browser_controls(page, base_url):
 
             captured = []
             downloads = []
+            responses = []
+            generated = []
+
+            def remember_url(u, source="request"):
+                if not valid_url(u):
+                    return
+
+                if is_generated_download_url(u):
+                    if u not in generated:
+                        generated.append(u)
+                    print(f"[GENERATED DOWNLOAD URL] ({source}) {u}")
+
+                if not _browser_asset(u) and u not in captured:
+                    captured.append(u)
 
             def on_request(req):
-                u = req.url
-                if valid_url(u) and not _browser_asset(u):
-                    if u not in captured:
-                        captured.append(u)
+                remember_url(req.url, "request")
 
             def on_download(download):
                 try:
-                    u = download.url
-                    if valid_url(u):
-                        downloads.append(u)
+                    remember_url(download.url, "download")
+                    if valid_url(download.url) and download.url not in downloads:
+                        downloads.append(download.url)
+                except Exception:
+                    pass
+
+            def on_response(response):
+                try:
+                    if is_generated_download_url(response.url):
+                        remember_url(response.url, "response")
+                    responses.append(response)
                 except Exception:
                     pass
 
             page.on("request", on_request)
             page.on("download", on_download)
+            page.on("response", on_response)
 
             popup_url = None
+            click_performed = False
             try:
                 async with page.expect_popup(timeout=2500) as popup_info:
                     await control.click(timeout=5000)
+                    click_performed = True
                 popup = await popup_info.value
                 try:
                     await popup.wait_for_load_state("domcontentloaded", timeout=5000)
                 except Exception:
                     pass
                 popup_url = popup.url
-                if valid_url(popup_url) and popup_url not in captured:
-                    captured.append(popup_url)
+                if valid_url(popup_url):
+                    remember_url(popup_url, "popup")
                 for u in await _collect_browser_links(popup, popup.url):
+                    if u not in discovered:
+                        discovered.append(u)
+                for u in await _collect_rendered_urls(popup, popup.url):
                     if u not in discovered:
                         discovered.append(u)
                 await popup.close()
             except Exception:
-                try:
-                    await control.click(timeout=5000)
-                except Exception:
-                    continue
+                # expect_popup raises when the click does not open a popup,
+                # but the click itself has already happened. Do not click
+                # the generator a second time. Retry only if the click never
+                # actually occurred.
+                if not click_performed:
+                    try:
+                        await control.click(timeout=5000)
+                    except Exception:
+                        continue
 
-            await page.wait_for_timeout(2500)
+            # Give client-side code enough time to write the generated URL
+            # into the DOM or navigate/open a download request.
+            await page.wait_for_timeout(5000)
+
+            # Read rendered DOM again after the click. This catches URLs in
+            # inputs, textareas, visible text, or dynamically injected HTML.
+            rendered_urls = await _collect_rendered_urls(page, page.url)
+            for u in rendered_urls:
+                if is_generated_download_url(u) and u not in generated:
+                    generated.append(u)
+                    print("[GENERATED DOWNLOAD URL] (DOM)", u)
+                if valid_url(u) and not _browser_asset(u) and u not in discovered:
+                    discovered.append(u)
+
+            # Some sites return the generated URL in an XHR/fetch response
+            # body rather than inserting it as a link. Inspect a bounded set
+            # of response bodies and extract URLs from JSON/text.
+            for response in responses[-30:]:
+                try:
+                    if response.request.resource_type not in {"xhr", "fetch", "document"}:
+                        continue
+                    body = await response.text()
+                    for u in _extract_urls_from_text(body):
+                        if is_generated_download_url(u) and u not in generated:
+                            generated.append(u)
+                            print("[GENERATED DOWNLOAD URL] (response body)", u)
+                        if valid_url(u) and not _browser_asset(u) and u not in discovered:
+                            discovered.append(u)
+                except Exception:
+                    pass
 
             if downloads:
                 for u in downloads:
+                    if is_generated_download_url(u) and u not in generated:
+                        generated.append(u)
                     if u not in discovered:
                         discovered.append(u)
 
@@ -544,8 +702,6 @@ async def _click_browser_controls(page, base_url):
                 discovered.append(popup_url)
 
             for u in captured:
-                # Keep the clicked control's own href, direct results, and
-                # newly generated URLs. Ignore obvious browser assets.
                 if not _browser_asset(u) and u not in discovered:
                     discovered.append(u)
 
@@ -553,11 +709,25 @@ async def _click_browser_controls(page, base_url):
                 if u not in discovered:
                     discovered.append(u)
 
+            # Always put dynamically generated download URLs first. This is
+            # what makes /debug easy to use: the useful generated URL isn't
+            # buried under the site's ordinary navigation links.
+            for u in reversed(generated):
+                if u in discovered:
+                    discovered.remove(u)
+                generated_first.insert(0, u)
+
         except Exception as e:
             print("[BROWSER CLICK ERROR]", item.get("text"), e)
             continue
 
-    return discovered
+    # De-duplicate while preserving order and prioritize generated URLs.
+    ordered = []
+    for u in generated_first + discovered:
+        if u not in ordered:
+            ordered.append(u)
+
+    return ordered
 
 
 async def fetch_page_browser(url):
