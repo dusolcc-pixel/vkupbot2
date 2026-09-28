@@ -4,6 +4,7 @@ import re
 import html
 import requests
 import asyncio
+from io import BytesIO
 
 # ============================================================
 # DOMAINS THAT MUST USE A REAL BROWSER (CLICK METHOD)
@@ -77,7 +78,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -93,7 +94,20 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-ROUTES_FILE = "routes.json"
+# Always resolve routes.json relative to this Python file.
+# This avoids problems when a host starts the bot from a different
+# working directory (common with Koyeb, Docker, Colab, etc.).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROUTES_FILE = os.path.join(BASE_DIR, "routes.json")
+
+# Optional GitHub fallback. If local routes.json does not exist,
+# the bot downloads the JSON from this URL.
+# Set this in your hosting environment, for example on Koyeb:
+# ROUTES_GITHUB_URL=https://raw.githubusercontent.com/USER/REPO/main/routes.json
+ROUTES_GITHUB_URL = os.getenv(
+    "ROUTES_GITHUB_URL",
+    ""
+).strip()
 
 # Optional built-in routes. These survive hosts that wipe routes.json on restart.
 # Add permanent routes here manually when needed.
@@ -170,34 +184,117 @@ def upload_to_spacebin(content):
 def load_routes():
     routes = {}
 
-    if os.path.exists(ROUTES_FILE):
+    # --------------------------------------------------------
+    # 1. Local routes.json always has priority.
+    # --------------------------------------------------------
+    if os.path.isfile(ROUTES_FILE):
+        print(f"[ROUTES] Loading local file: {ROUTES_FILE}")
+
         try:
             with open(
                 ROUTES_FILE,
                 "r",
                 encoding="utf-8"
             ) as f:
-
                 data = json.load(f)
 
-            if isinstance(data, dict):
-                routes.update(data)
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "routes.json root must be a JSON object"
+                )
+
+            routes.update(data)
+
+            print(
+                "[ROUTES] Local routes loaded:",
+                list(routes.keys())
+            )
+
+        except Exception as e:
+            # Do not silently fall back to an older GitHub copy when a
+            # local file exists but is broken. That would hide mistakes.
+            print(
+                "[ROUTES] Local routes.json read error:",
+                repr(e)
+            )
+            return _add_default_routes(routes)
+
+    # --------------------------------------------------------
+    # 2. No local file: use GitHub fallback if configured.
+    # --------------------------------------------------------
+    elif ROUTES_GITHUB_URL:
+        print(
+            "[ROUTES] Local routes.json not found. "
+            "Fetching from GitHub..."
+        )
+        print(
+            "[ROUTES] GitHub URL:",
+            ROUTES_GITHUB_URL
+        )
+
+        try:
+            response = requests.get(
+                ROUTES_GITHUB_URL,
+                headers={
+                    "User-Agent": HEADERS["User-Agent"],
+                    "Accept": "application/json,text/plain,*/*",
+                },
+                timeout=15,
+            )
+
+            response.raise_for_status()
+            data = response.json()
+
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "GitHub routes.json root must be a JSON object"
+                )
+
+            routes.update(data)
+
+            print(
+                "[ROUTES] GitHub routes loaded:",
+                list(routes.keys())
+            )
 
         except Exception as e:
             print(
-                "routes.json read error:",
-                e
+                "[ROUTES] GitHub routes read error:",
+                repr(e)
             )
 
-    # Built-in defaults always win when there is no matching saved route.
+    else:
+        print(
+            "[ROUTES] No local routes.json and "
+            "ROUTES_GITHUB_URL is not configured."
+        )
+
+    return _add_default_routes(routes)
+
+
+def _add_default_routes(routes):
+    # Built-in defaults are used only when a route with the same name
+    # was not supplied by local storage or GitHub.
     for name, route in DEFAULT_ROUTES.items():
         if name not in routes and isinstance(route, dict):
             routes[name] = json.loads(json.dumps(route))
+
+    print(
+        "[ROUTES] Final routes:",
+        list(routes.keys())
+    )
 
     return routes
 
 
 def save_routes(routes):
+    # /addroute and route editing always write to the local runtime file.
+    # This works on traditional hosts and also on hosts such as Koyeb.
+    # On ephemeral hosts, use /export to preserve the resulting JSON.
+    os.makedirs(
+        os.path.dirname(ROUTES_FILE),
+        exist_ok=True
+    )
 
     temp_file = ROUTES_FILE + ".tmp"
 
@@ -206,7 +303,6 @@ def save_routes(routes):
         "w",
         encoding="utf-8"
     ) as f:
-
         json.dump(
             routes,
             f,
@@ -218,6 +314,61 @@ def save_routes(routes):
         temp_file,
         ROUTES_FILE
     )
+
+    print(
+        "[ROUTES] Saved locally to:",
+        ROUTES_FILE
+    )
+
+
+async def export_routes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export the currently loaded routes.json to Telegram."""
+
+    try:
+        routes = load_routes()
+
+        if not routes:
+            await update.message.reply_text(
+                "❌ No routes found to export."
+            )
+            return
+
+        export_data = json.dumps(
+            routes,
+            indent=4,
+            ensure_ascii=False
+        )
+
+        document = InputFile(
+            BytesIO(export_data.encode("utf-8")),
+            filename="routes.json"
+        )
+
+        await update.message.reply_document(
+            document=document,
+            caption=(
+                "📦 <b>Routes exported</b>\n\n"
+                f"Routes: <b>{len(routes)}</b>\n"
+                "This is the current route configuration loaded by the bot."
+            ),
+            parse_mode="HTML"
+        )
+
+        print(
+            f"[ROUTES] Exported {len(routes)} route(s) to Telegram."
+        )
+
+    except Exception as e:
+        print(
+            "[ROUTES] Export error:",
+            repr(e)
+        )
+
+        await update.message.reply_text(
+            "❌ Failed to export routes.\n\n"
+            f"<code>{html.escape(str(e)[:1500])}</code>",
+            parse_mode="HTML"
+        )
 
 
 # ============================================================
@@ -4237,6 +4388,19 @@ def main():
         "=" * 60
     )
 
+    print(
+        "[ROUTES] Local file:",
+        ROUTES_FILE
+    )
+    print(
+        "[ROUTES] Local file exists:",
+        os.path.isfile(ROUTES_FILE)
+    )
+    print(
+        "[ROUTES] GitHub fallback configured:",
+        bool(ROUTES_GITHUB_URL)
+    )
+
     routes = load_routes()
 
     print(
@@ -4308,6 +4472,13 @@ def main():
         CommandHandler(
             "routes",
             routes_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "export",
+            export_routes_command
         )
     )
 
