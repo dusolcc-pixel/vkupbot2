@@ -11,7 +11,10 @@
         "final": {
             "type": "query_parameter",
             "parameter": "url"
-        }
+        },
+        "aliases": [
+            "gdlink.dev"
+        ]
     },
     "hubcloud": {
         "main_domain": "hubcloud.ist",
