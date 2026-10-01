@@ -50,6 +50,7 @@ GDFlIX_DOMAINS = {
     "gdflix.dad",
     "gdflix.net",
     "gdlink.dev",
+    # "new-gdflix-mirror.example",
 }
 
 # Also keep the old automatic marker behavior. Any hostname
@@ -1939,6 +1940,263 @@ async def debug_page(
         )
 
 # ============================================================
+# PACK / BACKLINK LINK FILTERING
+# ============================================================
+
+PACK_IGNORED_PATH_WORDS = {
+    "login", "logout", "signin", "signup", "register",
+    "account", "profile", "settings", "contact", "about",
+    "privacy", "terms", "dmca", "home",
+}
+
+
+def get_route_for_url(url, routes):
+    """Return (route_name, route) for a configured resolver URL."""
+
+    hostname = (urlparse(url).hostname or "").lower()
+
+    for name, candidate in routes.items():
+        if not isinstance(candidate, dict):
+            continue
+
+        possible_domains = []
+
+        main_domain = candidate.get("main_domain")
+        main_domains = candidate.get("main_domains", [])
+        aliases = candidate.get("aliases", [])
+
+        if main_domain:
+            possible_domains.append(main_domain)
+
+        if isinstance(main_domains, str):
+            main_domains = [main_domains]
+        if isinstance(main_domains, list):
+            possible_domains.extend(main_domains)
+
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if isinstance(aliases, list):
+            possible_domains.extend(aliases)
+
+        for domain in possible_domains:
+            if domain_matches(url, domain):
+                return name, candidate
+
+        # Preserve the existing family behavior.
+        if (
+            hostname.startswith("hubcloud.")
+            and main_domain
+            and clean_domain(main_domain).startswith("hubcloud.")
+        ):
+            return name, candidate
+
+        if (
+            "gdflix" in hostname
+            and main_domain
+            and "gdflix" in clean_domain(main_domain)
+        ):
+            return name, candidate
+
+    return None, None
+
+
+def looks_like_pack_navigation(url, anchor_text=""):
+    """Reject obvious navigation/account links from pack pages."""
+
+    try:
+        parsed = urlparse(url)
+        path = (parsed.path or "").strip().lower()
+        text = (anchor_text or "").strip().lower()
+
+        if path in ("", "/"):
+            return True
+
+        path_parts = {part for part in path.split("/") if part}
+        if path_parts.intersection(PACK_IGNORED_PATH_WORDS):
+            return True
+
+        navigation_words = {
+            "login", "log in", "logout", "log out", "sign in",
+            "signin", "sign up", "signup", "register", "home",
+            "about", "contact", "privacy", "terms", "account",
+            "profile", "settings",
+        }
+
+        if text in navigation_words:
+            return True
+
+    except Exception:
+        return True
+
+    return False
+
+
+def extract_pack_file_links(response, routes, page_url=None):
+    """
+    Extract only <a href> links that belong to configured resolver routes.
+
+    We deliberately do NOT accept every URL found in JavaScript. That
+    would also collect ads, analytics, API URLs, images, login URLs, etc.
+    """
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    found = []
+    seen = set()
+    page_url = page_url or response.url
+
+    for anchor in soup.find_all("a", href=True):
+        href = (anchor.get("href", "") or "").strip()
+        if not href:
+            continue
+
+        if href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+
+        href = urljoin(response.url, href)
+        if not valid_url(href):
+            continue
+
+        # Do not feed the supplied pack page back into itself.
+        if href.rstrip("/") == page_url.rstrip("/"):
+            continue
+
+        route_name, route = get_route_for_url(href, routes)
+        if route is None:
+            continue
+
+        anchor_text = anchor.get_text(" ", strip=True)
+        if looks_like_pack_navigation(href, anchor_text):
+            continue
+
+        if href in seen:
+            continue
+
+        seen.add(href)
+        found.append({
+            "url": href,
+            "text": anchor_text,
+            "route_name": route_name,
+        })
+
+    return found
+
+
+async def try_extract_pack_links(pack_url, routes):
+    """Open a page and return only configured resolver/file links."""
+
+    session = requests.Session()
+    response, rendered_links = await fetch_page(session, pack_url)
+
+    candidates = extract_pack_file_links(
+        response,
+        routes,
+        page_url=pack_url,
+    )
+
+    # Browser-rendered pages such as TitanCloud return their useful links
+    # through fetch_page_browser(). The synthetic PageResult used there does
+    # not contain the original <a> tags, so use the already captured rendered
+    # links as a second source. They are still filtered against routes.json.
+    if not candidates and rendered_links:
+        seen = set()
+
+        for href in rendered_links:
+            if not valid_url(href):
+                continue
+
+            if href.rstrip("/") == pack_url.rstrip("/"):
+                continue
+
+            route_name, route = get_route_for_url(
+                href,
+                routes,
+            )
+
+            if route is None:
+                continue
+
+            if looks_like_pack_navigation(href, ""):
+                continue
+
+            if href in seen:
+                continue
+
+            seen.add(href)
+            candidates.append({
+                "url": href,
+                "text": "",
+                "route_name": route_name,
+            })
+
+    urls = []
+    for item in candidates:
+        if item["url"] not in urls:
+            urls.append(item["url"])
+
+    print("[PACK] Page:", pack_url)
+    print("[PACK] Found", len(urls), "resolver/file links")
+
+    for item in candidates:
+        print(
+            "[PACK LINK]",
+            item["route_name"],
+            item["text"],
+            "->",
+            item["url"],
+        )
+
+    return urls
+
+
+async def automatic_resolve_pack(update, context, pack_url, routes=None):
+    """Scan a pack/backlink page and resolve only supported file links."""
+
+    if routes is None:
+        routes = load_routes()
+
+    if not routes:
+        await update.message.reply_text(
+            "❌ No routes are configured.\n\nUse /addroute first."
+        )
+        return False
+
+    try:
+        extracted_urls = await try_extract_pack_links(
+            pack_url,
+            routes,
+        )
+
+        if not extracted_urls:
+            return False
+
+        await update.message.reply_text(
+            "🔎 <b>Pack/page detected</b>\n\n"
+            f"<code>{html.escape(pack_url)}</code>\n\n"
+            f"📦 Found <b>{len(extracted_urls)}</b> supported file link(s).\n"
+            "▶️ Starting resolver...",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+        await automatic_resolve(
+            update,
+            context,
+            extracted_urls,
+        )
+
+        return True
+
+    except Exception as e:
+        print("[PACK ERROR]", repr(e))
+        await update.message.reply_text(
+            "❌ <b>Pack/page scan failed</b>\n\n"
+            f"<code>{html.escape(str(e)[:1500])}</code>",
+            parse_mode="HTML",
+        )
+        return True
+
+
+# ============================================================
 # AUTOMATIC RESOLVE
 # ============================================================
 
@@ -1965,66 +2223,10 @@ async def automatic_resolve(
     result_message_ids = []
 
     for index, start_url in enumerate(urls, start=1):
-        route_name = None
-        route = None
-
-        # ----------------------------------------------------
-        # Find a route for the input URL.
-        # Old HubCloud domains use the current HubCloud route.
-        # ----------------------------------------------------
-        for name, candidate in routes.items():
-            if not isinstance(candidate, dict):
-                continue
-
-            main_domain = candidate.get("main_domain")
-            main_domains = candidate.get("main_domains", [])
-            aliases = candidate.get("aliases", [])
-
-            possible_domains = []
-
-            if main_domain:
-                possible_domains.append(main_domain)
-
-            if isinstance(main_domains, str):
-                main_domains = [main_domains]
-
-            if isinstance(main_domains, list):
-                possible_domains.extend(main_domains)
-
-            if isinstance(aliases, str):
-                aliases = [aliases]
-
-            if isinstance(aliases, list):
-                possible_domains.extend(aliases)
-
-            for domain in possible_domains:
-                if domain_matches(start_url, domain):
-                    route_name = name
-                    route = candidate
-                    break
-
-            if route:
-                break
-
-            hostname = (urlparse(start_url).hostname or "").lower()
-
-            if (
-                hostname.startswith("hubcloud.")
-                and main_domain
-                and clean_domain(main_domain).startswith("hubcloud.")
-            ):
-                route_name = name
-                route = candidate
-                break
-
-            if (
-                "gdflix" in hostname
-                and main_domain
-                and "gdflix" in clean_domain(main_domain)
-            ):
-                route_name = name
-                route = candidate
-                break
+        route_name, route = get_route_for_url(
+            start_url,
+            routes,
+        )
 
         if route is None:
             await update.message.reply_text(
@@ -3156,11 +3358,48 @@ async def handle_text(
 
         if urls:
 
-            await automatic_resolve(
-                update,
-                context,
-                urls
-            )
+            routes = load_routes()
+
+            if not routes:
+                await update.message.reply_text(
+                    "❌ No routes are configured."
+                )
+                return
+
+            # ------------------------------------------------
+            # A supplied URL can be either:
+            #   1. a normal resolver link, or
+            #   2. a pack/backlink page.
+            #
+            # For every URL we first inspect the page for links
+            # belonging to our configured resolver routes. If
+            # supported links are found, it is treated as a pack.
+            # Otherwise the URL goes through the normal resolver.
+            # ------------------------------------------------
+            normal_urls = []
+
+            for supplied_url in urls:
+                try:
+                    was_pack = await automatic_resolve_pack(
+                        update,
+                        context,
+                        supplied_url,
+                        routes,
+                    )
+
+                    if not was_pack:
+                        normal_urls.append(supplied_url)
+
+                except Exception as e:
+                    print("[PACK DETECTION ERROR]", repr(e))
+                    normal_urls.append(supplied_url)
+
+            if normal_urls:
+                await automatic_resolve(
+                    update,
+                    context,
+                    normal_urls,
+                )
 
             return
 
