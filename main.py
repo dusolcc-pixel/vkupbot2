@@ -49,6 +49,7 @@ GDFlIX_DOMAINS = {
     "gdflix.io",
     "gdflix.dad",
     "gdflix.net",
+    "gdlink.dev",
     # "new-gdflix-mirror.example",
 }
 
