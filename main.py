@@ -640,60 +640,55 @@ def _is_generate_button_text(text):
 
 
 async def _collect_browser_links(page, base_url):
+    """
+    Collect links from the rendered DOM, Link-Grabber style.
+
+    Important for pack pages:
+    - Do NOT require the anchor to be visible.
+    - Do NOT filter by anchor text.
+    - Do NOT filter by resolver domain here.
+    - Return every normal HTTP(S) anchor href found in the rendered page.
+
+    Pack pages are often populated by JavaScript after the initial HTML
+    response, so this runs against the live browser DOM.
+    """
     links = []
 
     try:
-        anchors = await page.locator("a[href]").evaluate_all(
-            """els => els.map(a => ({
-                href: a.href || "",
-                text: (a.innerText || a.textContent || "").trim(),
-                visible: !!(a.offsetWidth || a.offsetHeight || a.getClientRects().length)
+        anchors = await page.locator('a[href], area[href]').evaluate_all(
+            """els => els.map(el => ({
+                href: el.href || el.getAttribute('href') || ''
             }))"""
         )
-    except Exception:
+    except Exception as e:
+        print("[BROWSER ANCHOR ERROR]", e)
         anchors = []
 
     for item in anchors:
         href = (item.get("href") or "").strip()
-        if not href or _browser_asset(href):
+
+        if not href:
             continue
-        if item.get("visible") or not item.get("text"):
-            if valid_url(href) and href not in links:
-                links.append(href)
 
-    try:
-        controls = await page.locator(
-            'button, [role="button"], input[type="button"], input[type="submit"], [onclick], [data-href], [data-url], [data-link]'
-        ).evaluate_all(
-            """els => els.map((el, i) => ({
-                i,
-                text: (el.innerText || el.textContent || el.value || "").trim(),
-                href: el.href || "",
-                dataHref: el.getAttribute("data-href") || "",
-                dataUrl: el.getAttribute("data-url") || "",
-                dataLink: el.getAttribute("data-link") || "",
-                onclick: el.getAttribute("onclick") || "",
-                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-            }))"""
-        )
-    except Exception:
-        controls = []
+        if href.lower().startswith((
+            "javascript:",
+            "mailto:",
+            "tel:",
+            "data:",
+            "blob:",
+            "#",
+        )):
+            continue
 
-    for item in controls:
-        for raw in (
-            item.get("href"),
-            item.get("dataHref"),
-            item.get("dataUrl"),
-            item.get("dataLink"),
-            item.get("onclick"),
-        ):
-            if not raw:
-                continue
-            for href in _extract_urls_from_text(raw):
-                href = urljoin(base_url, href)
-                if valid_url(href) and not _browser_asset(href) and href not in links:
-                    links.append(href)
+        href = urljoin(base_url, href)
 
+        if not valid_url(href):
+            continue
+
+        if href not in links:
+            links.append(href)
+
+    print(f"[BROWSER LINKS] Collected {len(links)} rendered anchor links from {base_url}")
     return links
 
 
@@ -1071,6 +1066,33 @@ async def fetch_page_browser(url, pack_mode=False):
                 pass
 
             await page.wait_for_timeout(BROWSER_WAIT_MS)
+
+            if pack_mode:
+                # Pack pages may append hundreds of anchors asynchronously.
+                # Wait for the rendered anchor count to stop changing rather
+                # than assuming the first DOM snapshot is complete.
+                last_count = -1
+                stable_rounds = 0
+
+                for _ in range(12):
+                    try:
+                        count = await page.locator("a[href], area[href]").count()
+                    except Exception:
+                        count = 0
+
+                    print(f"[PACK WAIT] rendered anchor count={count}")
+
+                    if count == last_count:
+                        stable_rounds += 1
+                    else:
+                        stable_rounds = 0
+
+                    last_count = count
+
+                    if count > 0 and stable_rounds >= 2:
+                        break
+
+                    await page.wait_for_timeout(1000)
 
             if requires_auth_browser(url) and not auth_state_exists(url):
                 print(
@@ -2093,22 +2115,31 @@ def extract_pack_links(response, rendered_links=None):
 
 
 async def scan_pack_page(pack_url):
-    """Open a pack page and collect all of its page links."""
+    """
+    Open ANY pack/backlink page in a real browser and collect the links that
+    are actually present in the rendered DOM, similar to a Link Grabber
+    extension.
 
-    session = requests.Session()
+    The browser is intentionally used for ALL pack pages, even if the domain
+    normally uses requests/curl_cffi for its resolver. This is because a pack
+    page can create its file anchors with JavaScript after page load.
+    """
 
-    if should_use_browser(pack_url):
-        print("[PACK BROWSER] Rendering pack without clicks:", pack_url)
-        response, rendered_links = await fetch_page_browser(
-            pack_url,
-            pack_mode=True,
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "Playwright is required to scan pack pages."
         )
-    else:
-        response, rendered_links = await fetch_page(
-            session,
-            pack_url,
-        )
 
+    print("[PACK BROWSER] Opening pack page:", pack_url)
+
+    response, rendered_links = await fetch_page_browser(
+        pack_url,
+        pack_mode=True,
+    )
+
+    # The browser collector above already sees the live DOM. Keep the raw
+    # HTML anchor pass as a second path in case the page exposes additional
+    # anchors in the serialized DOM.
     links = extract_pack_links(
         response,
         rendered_links,
