@@ -2124,6 +2124,49 @@ async def scan_pack_page(pack_url):
     return links
 
 
+async def send_pack_links_report(update, pack_url, links):
+    """Send the complete list of links before resolution starts."""
+
+    if not links:
+        await update.message.reply_text(
+            "📦 <b>Pack scan complete</b>\n\n"
+            "No HTTP(S) page links were found.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    # Use a document so the complete list is visible even when the pack
+    # contains hundreds of links and Telegram's normal message limit is hit.
+    report = "\n".join(
+        [
+            f"Pack URL: {pack_url}",
+            f"Found links: {len(links)}",
+            "",
+            *(
+                f"{number}. {href}"
+                for number, href in enumerate(links, start=1)
+            ),
+        ]
+    )
+
+    document = InputFile(
+        BytesIO(report.encode("utf-8")),
+        filename="pack_extracted_links.txt",
+    )
+
+    await update.message.reply_document(
+        document=document,
+        caption=(
+            "🔎 <b>Pack links found</b>\n\n"
+            f"Found <b>{len(links)}</b> URL(s).\n"
+            "The TXT file above contains the complete list.\n\n"
+            "▶️ Sending these URLs one by one through the existing resolver now..."
+        ),
+        parse_mode="HTML",
+    )
+
+
 # ============================================================
 # AUTOMATIC RESOLVE
 # ============================================================
@@ -2148,16 +2191,41 @@ async def automatic_resolve(
         )
         return
 
-    # Keep the successful result message IDs in order for /i<number>.
     result_message_ids = []
+    total = len(urls)
 
     for index, start_url in enumerate(urls, start=1):
+        progress = None
+
+        try:
+            progress = await update.message.reply_text(
+                "🔄 <b>Processing extracted URL</b> "
+                f"<b>{index}/{total}</b>\n\n"
+                f"<code>{html.escape(start_url)}</code>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
         route_name, route = get_route_for_url(
             start_url,
             routes,
         )
 
         if route is None:
+            if progress is not None:
+                try:
+                    await progress.edit_text(
+                        "⏭ <b>Ignored</b> "
+                        f"<b>{index}/{total}</b>\n\n"
+                        "This extracted URL does not match any configured route.",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
             if report_unmatched:
                 await update.message.reply_text(
                     f"❌ <b>Link {index}</b>\n\n"
@@ -2168,12 +2236,29 @@ async def automatic_resolve(
             continue
 
         try:
-            session = requests.Session()
-
             normalized_url = normalize_start_url(
                 start_url,
                 route
             )
+
+            status_text = (
+                "🔄 <b>Resolving extracted URL</b> "
+                f"<b>{index}/{total}</b>\n\n"
+                f"Route: <b>{html.escape(route_name or 'unknown')}</b>\n"
+                f"URL: <code>{html.escape(normalized_url)}</code>"
+            )
+
+            if progress is not None:
+                try:
+                    await progress.edit_text(
+                        status_text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
+            session = requests.Session()
 
             final_url, history = await resolve_route(
                 session,
@@ -2186,8 +2271,6 @@ async def automatic_resolve(
                     "Resolver returned an empty URL."
                 )
 
-            # Every resolved result gets both the direct Telegram link
-            # and a Spacebin copy of the final URL.
             individual_spacebin = upload_to_spacebin(
                 final_url
             )
@@ -2211,11 +2294,19 @@ async def automatic_resolve(
                 buttons
             ])
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Send every result as a separate Telegram message.
-            # The long URL is never printed in the message body.
-            # ------------------------------------------------
+            if progress is not None:
+                try:
+                    await progress.edit_text(
+                        "✅ <b>Resolved</b> "
+                        f"<b>{index}/{total}</b>\n\n"
+                        f"Route: <b>{html.escape(route_name or 'unknown')}</b>\n"
+                        f"Final: <code>{html.escape(final_url)}</code>",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
             sent = await update.message.reply_text(
                 f"✅ <b>Link {index} resolved</b>",
                 parse_mode="HTML",
@@ -2223,7 +2314,6 @@ async def automatic_resolve(
                 disable_web_page_preview=True
             )
 
-            # Save this Telegram message -> final URL mapping.
             RESULT_MESSAGES[sent.message_id] = {
                 "chat_id": update.effective_chat.id,
                 "final_url": final_url,
@@ -2236,13 +2326,25 @@ async def automatic_resolve(
             )
 
         except Exception as e:
+            if progress is not None:
+                try:
+                    await progress.edit_text(
+                        "❌ <b>Failed</b> "
+                        f"<b>{index}/{total}</b>\n\n"
+                        f"Route: <b>{html.escape(route_name or 'unknown')}</b>\n"
+                        f"<code>{html.escape(str(e)[:1500])}</code>",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
             await update.message.reply_text(
                 f"❌ <b>Link {index} failed</b>\n\n"
                 f"<code>{html.escape(str(e)[:1000])}</code>",
                 parse_mode="HTML"
             )
 
-    # Save this batch in the user's chat state as a convenience.
     context.user_data["last_result_message_ids"] = result_message_ids
 
 
@@ -3327,19 +3429,20 @@ async def handle_text(
 
                         if not extracted:
                             await update.message.reply_text(
-                                "❌ No file links matching your configured routes were found in this pack.",
+                                "❌ Pack opened successfully, but no HTTP(S) page links were found.",
                                 disable_web_page_preview=True,
                             )
                             continue
 
-                        await update.message.reply_text(
-                            "📦 <b>Pack scanned</b>\n\n"
-                            f"Found <b>{len(extracted)}</b> file link(s).\n"
-                            "▶️ Starting resolver...",
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
+                        # TEST MODE: show the complete extracted URL list FIRST.
+                        await send_pack_links_report(
+                            update,
+                            supplied_url,
+                            extracted,
                         )
 
+                        # Then pass exactly those extracted URLs, in order,
+                        # to the existing resolver. No pack-specific filtering.
                         await automatic_resolve(
                             update,
                             context,
@@ -3363,10 +3466,7 @@ async def handle_text(
                 # A direct file URL is never treated as a pack.
                 # Send it straight into the existing resolver.
                 # ------------------------------------------------
-                if route is not None and is_pack_file_link(
-                    supplied_url,
-                    route_name,
-                ):
+                if route is not None:
                     normal_urls.append(supplied_url)
                     continue
 
