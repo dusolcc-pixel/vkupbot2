@@ -2158,19 +2158,21 @@ def is_pack_page_url(url, route_name=None):
     )
 
 
-def pack_file_path_matches(url, route_name):
+def pack_file_path_matches(url, route_name, pack_url=None):
     """
-    Return True only when an extracted pack URL has the known file-path
-    shape for the configured resolver route.
+    Return True only when an extracted pack URL looks like a file URL
+    for the corresponding resolver route.
 
-    The domain itself is NOT hardcoded here. Domain matching comes from
-    routes.json via get_route_for_url(), so a future domain change only
-    requires changing routes.json as long as the route's file path stays
-    the same.
+    For HubCloud, the pack URL itself tells us which section is being used.
+    Examples:
+        /drive/packs/<id> -> /drive/<file-id>
+        /video/packs/<id> -> /video/<file-id>
+
+    This avoids assuming every HubCloud pack uses /drive/.
     """
 
     try:
-        path = (urlparse(url).path or "").lower()
+        candidate_path = (urlparse(url).path or "").lower()
     except Exception:
         return False
 
@@ -2179,36 +2181,72 @@ def pack_file_path_matches(url, route_name):
     # GDFlix / GDLink
     if "gdflix" in name:
         return (
-            path.startswith("/file/")
-            and len(path) > len("/file/")
+            candidate_path.startswith("/file/")
+            and len(candidate_path) > len("/file/")
         )
 
     # HubCloud
     if "hubcloud" in name:
-        return (
-            path.startswith("/drive/")
-            and not path.startswith("/drive/packs/")
-            and len(path) > len("/drive/")
-        )
+        if not pack_url:
+            return candidate_path.startswith("/drive/") and len(candidate_path) > len("/drive/")
+
+        try:
+            pack_path = (urlparse(pack_url).path or "").lower()
+            marker = "/packs/"
+            if marker not in pack_path:
+                return False
+
+            # Everything before /packs/ is the section prefix.
+            # /video/packs/ABC -> file links under /video/<id>
+            # /drive/packs/ABC -> file links under /drive/<id>
+            prefix = pack_path.split(marker, 1)[0].rstrip("/")
+
+            if not prefix:
+                return False
+
+            expected_prefix = prefix + "/"
+
+            # Most HubCloud file links use /drive/<id>. Some pack sections
+            # use the same section prefix as the pack, e.g. /video/<id>.
+            # Accept either, but never accept another /packs/ page.
+            candidate_is_drive_file = (
+                candidate_path.startswith("/drive/")
+                and len(candidate_path) > len("/drive/")
+            )
+
+            candidate_matches_pack_prefix = (
+                candidate_path.startswith(expected_prefix)
+                and len(candidate_path) > len(expected_prefix)
+            )
+
+            return (
+                "/packs/" not in candidate_path
+                and (
+                    candidate_is_drive_file
+                    or candidate_matches_pack_prefix
+                )
+            )
+        except Exception:
+            return False
 
     # TitanCloud
     if "titancloud" in name:
         return (
-            path.startswith("/zfile/")
-            and len(path) > len("/zfile/")
+            candidate_path.startswith("/zfile/")
+            and len(candidate_path) > len("/zfile/")
         )
 
     # MNMCloud
     if "mnmcloud" in name:
         return (
-            path.startswith("/files/")
-            and len(path) > len("/files/")
+            candidate_path.startswith("/files/")
+            and len(candidate_path) > len("/files/")
         )
 
     return False
 
 
-def extract_pack_links(response, rendered_links=None):
+def extract_pack_links(response, rendered_links=None, pack_url=None):
     """
     Collect pack file links only.
 
@@ -2259,6 +2297,7 @@ def extract_pack_links(response, rendered_links=None):
         if not pack_file_path_matches(
             href,
             route_name,
+            pack_url,
         ):
             return
 
@@ -2326,6 +2365,7 @@ async def scan_pack_page(pack_url):
     links = extract_pack_links(
         response,
         rendered_links,
+        pack_url,
     )
 
     print(
