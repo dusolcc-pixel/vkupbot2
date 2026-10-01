@@ -1940,18 +1940,20 @@ async def debug_page(
         )
 
 # ============================================================
-# PACK / BACKLINK LINK FILTERING
+# PACK / BACKLINK EXTRACTION
+#
+# Pack handling deliberately does NOT add a second route system.
+# routes.json remains the only source of truth.
+#
+# We simply:
+#   1. open the supplied page
+#   2. collect links like a Link Grabber extension
+#   3. keep links that match an existing route
+#   4. pass those links to automatic_resolve()
 # ============================================================
 
-PACK_IGNORED_PATH_WORDS = {
-    "login", "logout", "signin", "signup", "register",
-    "account", "profile", "settings", "contact", "about",
-    "privacy", "terms", "dmca", "home",
-}
-
-
 def get_route_for_url(url, routes):
-    """Return (route_name, route) for a configured resolver URL."""
+    """Return (route_name, route) when URL matches routes.json."""
 
     hostname = (urlparse(url).hostname or "").lower()
 
@@ -1982,7 +1984,7 @@ def get_route_for_url(url, routes):
             if domain_matches(url, domain):
                 return name, candidate
 
-        # Preserve the existing family behavior.
+        # Keep the existing family matching behavior.
         if (
             hostname.startswith("hubcloud.")
             and main_domain
@@ -2000,200 +2002,89 @@ def get_route_for_url(url, routes):
     return None, None
 
 
-def looks_like_pack_navigation(url, anchor_text=""):
-    """Reject obvious navigation/account links from pack pages."""
+def extract_pack_links(response, rendered_links, routes, pack_url):
+    """Collect <a href> links and browser-rendered links, then route-filter."""
 
-    try:
-        parsed = urlparse(url)
-        path = (parsed.path or "").strip().lower()
-        text = (anchor_text or "").strip().lower()
-
-        if path in ("", "/"):
-            return True
-
-        path_parts = {part for part in path.split("/") if part}
-        if path_parts.intersection(PACK_IGNORED_PATH_WORDS):
-            return True
-
-        navigation_words = {
-            "login", "log in", "logout", "log out", "sign in",
-            "signin", "sign up", "signup", "register", "home",
-            "about", "contact", "privacy", "terms", "account",
-            "profile", "settings",
-        }
-
-        if text in navigation_words:
-            return True
-
-    except Exception:
-        return True
-
-    return False
-
-
-def extract_pack_file_links(response, routes, page_url=None):
-    """
-    Extract only <a href> links that belong to configured resolver routes.
-
-    We deliberately do NOT accept every URL found in JavaScript. That
-    would also collect ads, analytics, API URLs, images, login URLs, etc.
-    """
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    found = []
+    candidates = []
     seen = set()
-    page_url = page_url or response.url
 
-    for anchor in soup.find_all("a", href=True):
-        href = (anchor.get("href", "") or "").strip()
+    def consider(raw_url):
+        if not raw_url:
+            return
+
+        href = str(raw_url).strip()
         if not href:
-            continue
+            return
 
-        if href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
-            continue
+        if href.lower().startswith((
+            "javascript:",
+            "mailto:",
+            "tel:",
+            "data:",
+            "blob:",
+            "#",
+        )):
+            return
 
         href = urljoin(response.url, href)
-        if not valid_url(href):
-            continue
 
-        # Do not feed the supplied pack page back into itself.
-        if href.rstrip("/") == page_url.rstrip("/"):
-            continue
+        if not valid_url(href):
+            return
+
+        # Do not feed the page itself back into the resolver.
+        if href.rstrip("/") == pack_url.rstrip("/"):
+            return
 
         route_name, route = get_route_for_url(href, routes)
         if route is None:
-            continue
-
-        anchor_text = anchor.get_text(" ", strip=True)
-        if looks_like_pack_navigation(href, anchor_text):
-            continue
+            return
 
         if href in seen:
-            continue
+            return
 
         seen.add(href)
-        found.append({
-            "url": href,
-            "text": anchor_text,
-            "route_name": route_name,
-        })
+        candidates.append(href)
 
-    return found
+    # Normal HTTP/curl_cffi pages: behave like a basic Link Grabber.
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            consider(anchor.get("href", ""))
+    except Exception as e:
+        print("[PACK HTML ERROR]", repr(e))
+
+    # Browser-rendered pages: fetch_page_browser() already collected
+    # actual links from the rendered DOM. Apply the same route filter.
+    for href in rendered_links or []:
+        consider(href)
+
+    return candidates
 
 
-async def try_extract_pack_links(pack_url, routes):
-    """Open a page and return only configured resolver/file links."""
+async def scan_pack_page(pack_url, routes):
+    """Return configured-route URLs found on an arbitrary page."""
 
     session = requests.Session()
-    response, rendered_links = await fetch_page(session, pack_url)
-
-    candidates = extract_pack_file_links(
-        response,
-        routes,
-        page_url=pack_url,
+    response, rendered_links = await fetch_page(
+        session,
+        pack_url,
     )
 
-    # Browser-rendered pages such as TitanCloud return their useful links
-    # through fetch_page_browser(). The synthetic PageResult used there does
-    # not contain the original <a> tags, so use the already captured rendered
-    # links as a second source. They are still filtered against routes.json.
-    if not candidates and rendered_links:
-        seen = set()
-
-        for href in rendered_links:
-            if not valid_url(href):
-                continue
-
-            if href.rstrip("/") == pack_url.rstrip("/"):
-                continue
-
-            route_name, route = get_route_for_url(
-                href,
-                routes,
-            )
-
-            if route is None:
-                continue
-
-            if looks_like_pack_navigation(href, ""):
-                continue
-
-            if href in seen:
-                continue
-
-            seen.add(href)
-            candidates.append({
-                "url": href,
-                "text": "",
-                "route_name": route_name,
-            })
-
-    urls = []
-    for item in candidates:
-        if item["url"] not in urls:
-            urls.append(item["url"])
+    links = extract_pack_links(
+        response,
+        rendered_links,
+        routes,
+        pack_url,
+    )
 
     print("[PACK] Page:", pack_url)
-    print("[PACK] Found", len(urls), "resolver/file links")
+    print("[PACK] Matching configured-route links:", len(links))
 
-    for item in candidates:
-        print(
-            "[PACK LINK]",
-            item["route_name"],
-            item["text"],
-            "->",
-            item["url"],
-        )
+    for href in links:
+        route_name, _ = get_route_for_url(href, routes)
+        print("[PACK LINK]", route_name, "->", href)
 
-    return urls
-
-
-async def automatic_resolve_pack(update, context, pack_url, routes=None):
-    """Scan a pack/backlink page and resolve only supported file links."""
-
-    if routes is None:
-        routes = load_routes()
-
-    if not routes:
-        await update.message.reply_text(
-            "❌ No routes are configured.\n\nUse /addroute first."
-        )
-        return False
-
-    try:
-        extracted_urls = await try_extract_pack_links(
-            pack_url,
-            routes,
-        )
-
-        if not extracted_urls:
-            return False
-
-        await update.message.reply_text(
-            "🔎 <b>Pack/page detected</b>\n\n"
-            f"<code>{html.escape(pack_url)}</code>\n\n"
-            f"📦 Found <b>{len(extracted_urls)}</b> supported file link(s).\n"
-            "▶️ Starting resolver...",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-
-        await automatic_resolve(
-            update,
-            context,
-            extracted_urls,
-        )
-
-        return True
-
-    except Exception as e:
-        print("[PACK ERROR]", repr(e))
-        await update.message.reply_text(
-            "❌ <b>Pack/page scan failed</b>\n\n"
-            f"<code>{html.escape(str(e)[:1500])}</code>",
-            parse_mode="HTML",
-        )
-        return True
+    return links
 
 
 # ============================================================
@@ -3362,36 +3253,53 @@ async def handle_text(
 
             if not routes:
                 await update.message.reply_text(
-                    "❌ No routes are configured."
+                    "❌ No routes are configured.\n\nUse /addroute first."
                 )
                 return
 
             # ------------------------------------------------
-            # A supplied URL can be either:
-            #   1. a normal resolver link, or
-            #   2. a pack/backlink page.
+            # For each supplied URL:
+            #   - if it is a pack/backlink page, collect links
+            #     and keep only URLs recognized by routes.json
+            #   - otherwise use the existing resolver normally
             #
-            # For every URL we first inspect the page for links
-            # belonging to our configured resolver routes. If
-            # supported links are found, it is treated as a pack.
-            # Otherwise the URL goes through the normal resolver.
+            # We do NOT invent pack-specific path rules here.
+            # routes.json remains the source of truth.
             # ------------------------------------------------
             normal_urls = []
 
             for supplied_url in urls:
                 try:
-                    was_pack = await automatic_resolve_pack(
-                        update,
-                        context,
+                    extracted = await scan_pack_page(
                         supplied_url,
                         routes,
                     )
 
-                    if not was_pack:
+                    # If the page contains matching configured-route
+                    # links, treat it as a pack/backlink page.
+                    if extracted:
+                        await update.message.reply_text(
+                            "📦 <b>Page links found</b>\n\n"
+                            f"Found <b>{len(extracted)}</b> link(s) matching your configured routes.\n"
+                            "▶️ Starting resolver...",
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+
+                        await automatic_resolve(
+                            update,
+                            context,
+                            extracted,
+                        )
+                    else:
+                        # No configured-route links on the page. It is
+                        # probably an ordinary resolver URL, so preserve
+                        # the original behavior exactly.
                         normal_urls.append(supplied_url)
 
                 except Exception as e:
-                    print("[PACK DETECTION ERROR]", repr(e))
+                    print("[PACK SCAN ERROR]", repr(e))
+                    # If scanning fails, do not lose the original URL.
                     normal_urls.append(supplied_url)
 
             if normal_urls:
