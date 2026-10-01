@@ -2129,18 +2129,32 @@ def get_route_for_url(url, routes):
 
 
 def is_pack_page_url(url, route_name=None):
-    """Identify the supplied URL as a pack/backlink page."""
+    """Identify the supplied URL as a pack/backlink page.
+
+    HubCloud uses /packs/ as its pack marker, including variants such as:
+        /video/packs/<id>
+        /drive/packs/<id>
+        /something/packs/<id>
+
+    Other services keep the existing /pack/ and /packs/ detection.
+    """
     try:
-        path = (urlparse(url).path or "").strip().lower()
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        path = (parsed.path or "").strip().lower()
     except Exception:
         return False
 
+    # HubCloud pack pages use the literal /packs/ marker.
+    if hostname.startswith("hubcloud."):
+        return "/packs/" in path
+
+    # Existing pack behavior for the other configured services.
     return (
         path == "/pack"
         or path.startswith("/pack/")
         or path == "/packs"
         or path.startswith("/packs/")
-        or path.startswith("/drive/packs/")
     )
 
 
