@@ -49,7 +49,7 @@ GDFlIX_DOMAINS = {
     "gdflix.io",
     "gdflix.dad",
     "gdflix.net",
-    # "new-gdflix-mirror.example",
+    "gdlink.dev",
 }
 
 # Also keep the old automatic marker behavior. Any hostname
