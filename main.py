@@ -19,6 +19,7 @@ from io import BytesIO
 #
 BROWSER_FIRST_DOMAINS = {
     "titancloud.site",  # click method
+    "greenmotors.club",  # use Playwright instead of requests for this site
     # Add more JavaScript/click sites here manually:
     # "technocloud.site",
     # "examplecloud.com",
@@ -1145,11 +1146,29 @@ async def fetch_page_browser(url, pack_mode=False):
         attach_page_handlers(page)
 
         try:
-            await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=BROWSER_TIMEOUT_MS
-            )
+            # Keep the main-document HTTP status for /debug output. A browser
+            # can render a 403 response; do not pretend it was an HTTP 200.
+            navigation_status = 0
+            try:
+                navigation_response = await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_TIMEOUT_MS
+                )
+                if navigation_response is not None:
+                    navigation_status = navigation_response.status
+            except Exception as navigation_error:
+                # Some pages continue rendering even if DOMContentLoaded times out.
+                # Keep inspecting that live page when possible; re-raise non-timeout
+                # navigation errors instead of silently treating them as success.
+                error_text = str(navigation_error).lower()
+                error_type = navigation_error.__class__.__name__.lower()
+                if "timeout" not in error_text and "timeout" not in error_type:
+                    raise
+                print("[BROWSER NAVIGATION TIMEOUT]", repr(navigation_error))
+
+                if page.url in ("", "about:blank"):
+                    raise
 
             try:
                 await page.wait_for_load_state("networkidle", timeout=5000)
@@ -1308,7 +1327,7 @@ async def fetch_page_browser(url, pack_mode=False):
                         + html.escape(page_text or "")
                         + "</body></html>"
                     ),
-                    status_code=200,
+                    status_code=navigation_status,
                     title=title or "",
                 ),
                 links,
@@ -1961,10 +1980,11 @@ async def debug_page(
                 "session"
             ] = session
 
-        response, links = await fetch_page(
-            session,
-            url
-        )
+        # /debug always opens the URL in Chromium/Playwright, regardless of
+        # BROWSER_FIRST_DOMAINS or the normal resolver's HTTP engine selection.
+        # This also applies when the user chooses a link number in debug mode.
+        print("[DEBUG BROWSER] Opening in Playwright:", url)
+        response, links = await fetch_page_browser(url)
 
         # Save debug state
         context.user_data[
