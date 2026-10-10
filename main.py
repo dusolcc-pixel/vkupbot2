@@ -992,15 +992,51 @@ async def _click_browser_controls(page, base_url):
     return discovered
 
 
-async def fetch_page_browser(url, pack_mode=False):
+async def _cloudflare_challenge_present(page):
+    """Best-effort detection for a visible Cloudflare interstitial/Turnstile."""
+    try:
+        title = (await page.title()).lower()
+    except Exception:
+        title = ""
+    try:
+        body = (await page.locator("body").inner_text(timeout=3000)).lower()
+    except Exception:
+        body = ""
+
+    challenge_phrases = (
+        "just a moment",
+        "checking your browser",
+        "verify you are human",
+        "performing security verification",
+        "complete the security check",
+        "enable javascript and cookies to continue",
+    )
+    if any(phrase in title or phrase in body for phrase in challenge_phrases):
+        return True
+
+    try:
+        visible_challenge = page.locator(
+            'iframe[src*="challenges.cloudflare.com"]:visible, '
+            '.cf-turnstile:visible, #challenge-running:visible'
+        )
+        if await visible_challenge.count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def fetch_page_browser(url, pack_mode=False, manual_challenge=False, challenge_notice=None):
     if not PLAYWRIGHT_AVAILABLE:
         raise RuntimeError(
             "Playwright is not installed. Add it to requirements.txt."
         )
 
     async with async_playwright() as pw:
+        # /debug can opt into a visible browser so a human can complete
+        # a site's verification challenge. Normal fetches remain headless.
         browser = await pw.chromium.launch(
-            headless=BROWSER_HEADLESS,
+            headless=(False if manual_challenge else BROWSER_HEADLESS),
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -1176,6 +1212,47 @@ async def fetch_page_browser(url, pack_mode=False):
                 pass
 
             await page.wait_for_timeout(BROWSER_WAIT_MS)
+
+            # Do not attempt to solve or bypass a CAPTCHA automatically. In
+            # /debug's manual mode, show Chromium and let the operator complete
+            # the challenge themselves, then continue once it has cleared.
+            if manual_challenge and await _cloudflare_challenge_present(page):
+                print(
+                    "[CLOUDFLARE] Challenge detected. Complete it manually "
+                    "in the visible Chromium window (timeout: 180 seconds)."
+                )
+                if challenge_notice is not None:
+                    try:
+                        await challenge_notice()
+                    except Exception as notice_error:
+                        print("[CLOUDFLARE NOTICE ERROR]", notice_error)
+
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 180
+                clear_rounds = 0
+                while loop.time() < deadline:
+                    await page.wait_for_timeout(1000)
+                    if await _cloudflare_challenge_present(page):
+                        clear_rounds = 0
+                    else:
+                        clear_rounds += 1
+                        if clear_rounds >= 3:
+                            print("[CLOUDFLARE] Challenge appears cleared; continuing.")
+                            break
+
+                if clear_rounds < 3:
+                    raise TimeoutError(
+                        "Cloudflare verification was not completed within 180 seconds. "
+                        "Run /debug locally with a visible desktop browser and complete "
+                        "the challenge manually, or request authorized access from the site owner."
+                    )
+
+                # Let post-challenge navigation and page scripts settle.
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
 
             if pack_mode:
                 # Pack pages may append hundreds of anchors asynchronously.
@@ -1984,7 +2061,24 @@ async def debug_page(
         # BROWSER_FIRST_DOMAINS or the normal resolver's HTTP engine selection.
         # This also applies when the user chooses a link number in debug mode.
         print("[DEBUG BROWSER] Opening in Playwright:", url)
-        response, links = await fetch_page_browser(url)
+
+        async def notify_manual_challenge():
+            await status.edit_text(
+                "⚠️ <b>Cloudflare verification detected</b>\n\n"
+                "A visible Chromium window has opened. Complete the challenge "
+                "manually in that window. The bot will continue when the page "
+                "clears the challenge, up to 3 minutes.\n\n"
+                "This requires running the bot on a desktop session with a GUI; "
+                "a headless-only server cannot show you the challenge.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+        response, links = await fetch_page_browser(
+            url,
+            manual_challenge=True,
+            challenge_notice=notify_manual_challenge,
+        )
 
         # Save debug state
         context.user_data[
