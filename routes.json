@@ -1,6 +1,22 @@
 {
     "gdflix": {
         "main_domain": "new6.gdflix.io",
+        "fetch_method": "curl_cffi",
+        "fallback_methods": [
+            "browser",
+            "requests"
+        ],
+        "fallback_status_codes": [
+            401,
+            403,
+            408,
+            425,
+            429,
+            500,
+            502,
+            503,
+            504
+        ],
         "steps": [
             {
                 "targets": [
@@ -14,10 +30,12 @@
         },
         "aliases": [
             "gdlink.dev"
-        ]
+        ],
+        "fallback_if_missing_target": true
     },
     "hubcloud": {
         "main_domain": "hubcloud.ist",
+        "fetch_method": "requests",
         "steps": [
             {
                 "targets": [
@@ -40,6 +58,7 @@
     },
     "driveseed": {
         "main_domain": "driveseed.org",
+        "fetch_method": "requests",
         "steps": [
             {
                 "targets": [
@@ -54,6 +73,7 @@
     },
     "titancloud": {
         "main_domain": "titancloud.site",
+        "fetch_method": "browser",
         "steps": [],
         "direct_targets": [
             "workers.dev"
@@ -64,6 +84,7 @@
     },
     "mnmcloud 2": {
         "main_domain": "mnmcloud.fun",
+        "fetch_method": "browser",
         "steps": [],
         "direct_targets": [
             "video-downloads.googleusercontent.com"
