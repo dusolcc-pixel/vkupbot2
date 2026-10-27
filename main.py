@@ -462,6 +462,7 @@ class PageResult:
     text: str
     status_code: int = 200
     title: str = ""
+    headers: dict = None
 
 
 def hostname_of(url):
@@ -1144,8 +1145,9 @@ async def fetch_page_browser(url, pack_mode=False):
         page = await context.new_page()
         attach_page_handlers(page)
 
+        navigation_response = None
         try:
-            await page.goto(
+            navigation_response = await page.goto(
                 url,
                 wait_until="domcontentloaded",
                 timeout=BROWSER_TIMEOUT_MS
@@ -1308,7 +1310,7 @@ async def fetch_page_browser(url, pack_mode=False):
                         + html.escape(page_text or "")
                         + "</body></html>"
                     ),
-                    status_code=200,
+                    status_code=(navigation_response.status if navigation_response else 200),
                     title=title or "",
                 ),
                 links,
@@ -1459,43 +1461,214 @@ def extract_links(
 from curl_cffi import requests as cffi_requests
 
 
-async def fetch_page(session, url):
+FETCH_METHODS = {"auto", "requests", "curl_cffi", "browser"}
+FETCH_METHOD_ALIASES = {
+    "normal": "requests",
+    "http": "requests",
+    "cffi": "curl_cffi",
+    "curl": "curl_cffi",
+    "playwright": "browser",
+    "real_browser": "browser",
+    "real-browser": "browser",
+}
+DEFAULT_FALLBACK_STATUS_CODES = {401, 403, 408, 425, 429, 500, 502, 503, 504}
+
+
+def normalize_fetch_method(value):
+    """Normalize a fetch-engine name used by routes.json or /debug."""
+    method = str(value or "auto").strip().lower()
+    method = FETCH_METHOD_ALIASES.get(method, method)
+    if method not in FETCH_METHODS:
+        raise ValueError(
+            f"Unknown fetch method {value!r}. Use auto, requests, curl_cffi, or browser."
+        )
+    return method
+
+
+def _route_config_for_url(url):
+    """Return the route configuration whose domain/alias matches this URL."""
+    route_name = _route_name_for_domain(url)
+    if not route_name:
+        return {}
+    routes = load_routes()
+    route = routes.get(route_name)
+    return route if isinstance(route, dict) else {}
+
+
+def _default_fetch_method(url):
+    """Keep existing engine selection as the default for legacy routes."""
     if should_use_browser(url):
+        return "browser"
+    if should_use_gdflix(url):
+        return "curl_cffi"
+    return "requests"
+
+
+async def _fetch_page_with_method(session, url, method):
+    """Fetch one page with exactly one engine, preserving its real HTTP status."""
+    if method == "browser":
         print("[BROWSER] Rendering:", url)
         return await fetch_page_browser(url)
 
-    if should_use_gdflix(url):
-        print("[GDFlIX] Using curl_cffi:", url)
-        response = cffi_requests.get(
+    if method == "curl_cffi":
+        print("[GDFlIX/curl_cffi] Fetching:", url)
+        # Leave curl_cffi's browser-matched headers intact. A hard-coded,
+        # potentially mismatched User-Agent can make TLS/header fingerprints less consistent.
+        raw_response = cffi_requests.get(
             url,
             impersonate="chrome",
             timeout=25,
             allow_redirects=True,
         )
-        response.raise_for_status()
-        return response, extract_links(response)
+        links = extract_links(raw_response)
+        soup = BeautifulSoup(raw_response.text, "html.parser")
+        return PageResult(
+            url=raw_response.url,
+            text=raw_response.text,
+            status_code=raw_response.status_code,
+            title=soup.title.get_text(" ", strip=True) if soup.title else "",
+            headers=dict(getattr(raw_response, "headers", {}) or {}),
+        ), links
 
-    print("[HTTP] Using normal requests:", url)
-    response = session.get(
-        url,
-        headers=HEADERS,
-        timeout=25,
-        allow_redirects=True,
+    if method == "requests":
+        print("[HTTP/requests] Fetching:", url)
+        raw_response = session.get(
+            url,
+            headers=HEADERS,
+            timeout=25,
+            allow_redirects=True,
+        )
+        links = extract_links(raw_response)
+        soup = BeautifulSoup(raw_response.text, "html.parser")
+        return PageResult(
+            url=raw_response.url,
+            text=raw_response.text,
+            status_code=raw_response.status_code,
+            title=soup.title.get_text(" ", strip=True) if soup.title else "",
+            headers=dict(getattr(raw_response, "headers", {}) or {}),
+        ), links
+
+    raise ValueError(f"Unsupported fetch method: {method}")
+
+
+async def fetch_page(session, url, method_override=None):
+    """
+    Fetch page using the route-configured engine.
+
+    routes.json may set:
+      "fetch_method": "auto" | "requests" | "curl_cffi" | "browser"
+      "fallback_methods": ["browser", "requests"]
+      "fallback_status_codes": [403, 429, 503]
+
+    /debug can force one method by passing method_override. In forced mode
+    there is deliberately no fallback, so the result reflects that method.
+    """
+    forced_method = None
+    if method_override is not None:
+        requested = normalize_fetch_method(method_override)
+        if requested != "auto":
+            forced_method = requested
+
+    route = _route_config_for_url(url)
+
+    configured_method = normalize_fetch_method(route.get("fetch_method", "auto"))
+    primary_method = forced_method or (
+        configured_method if configured_method != "auto" else _default_fetch_method(url)
     )
-    response.raise_for_status()
 
-    return PageResult(
-        url=response.url,
-        text=response.text,
-        status_code=response.status_code,
-        title=(
-            BeautifulSoup(response.text, "html.parser").title.get_text(
-                " ", strip=True
-            )
-            if BeautifulSoup(response.text, "html.parser").title
-            else ""
-        ),
-    ), extract_links(response)
+    # A manually forced /debug method is a single-engine diagnostic.
+    if forced_method:
+        candidates = [forced_method]
+    else:
+        fallback_values = route.get("fallback_methods", [])
+        if isinstance(fallback_values, str):
+            fallback_values = [fallback_values]
+        fallbacks = []
+        for item in fallback_values if isinstance(fallback_values, list) else []:
+            try:
+                item = normalize_fetch_method(item)
+                if item != "auto" and item != primary_method and item not in fallbacks:
+                    fallbacks.append(item)
+            except ValueError as exc:
+                print("[ROUTES] Ignoring invalid fallback method:", exc)
+
+        # Safe default for older routes: when curl_cffi gets a blocking status,
+        # try Playwright if installed. This does not defeat a server-side block;
+        # it only gives JavaScript-dependent pages another normal access path.
+        if should_use_gdflix(url) and "browser" != primary_method and "browser" not in fallbacks:
+            fallbacks.append("browser")
+
+        candidates = [primary_method] + fallbacks
+
+    status_codes = route.get("fallback_status_codes", sorted(DEFAULT_FALLBACK_STATUS_CODES))
+    try:
+        retry_status_codes = {int(code) for code in status_codes}
+    except (TypeError, ValueError):
+        retry_status_codes = set(DEFAULT_FALLBACK_STATUS_CODES)
+
+    failures = []
+    last_response = None
+    last_links = []
+
+    for index, method in enumerate(candidates):
+        try:
+            response, links = await _fetch_page_with_method(session, url, method)
+        except Exception as exc:
+            failures.append(f"{method}: {type(exc).__name__}: {exc}")
+            print(f"[FETCH] {method} failed for {url}: {type(exc).__name__}: {exc}")
+            if forced_method or index == len(candidates) - 1:
+                raise RuntimeError(
+                    f"Could not fetch {url}. Methods tried: {', '.join(candidates)}. "
+                    f"Last error: {type(exc).__name__}: {exc}"
+                ) from exc
+            print(f"[FETCH] Falling back from {method} to {candidates[index + 1]}")
+            continue
+
+        last_response, last_links = response, links
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        print(f"[FETCH] method={method} status={status_code} url={getattr(response, 'url', url)} links={len(links)}")
+
+        if 200 <= status_code < 400:
+            return response, links
+
+        body_preview = re.sub(r"\s+", " ", str(getattr(response, "text", "") or "")).strip()[:500]
+        server = ""
+        try:
+            headers = getattr(response, "headers", {}) or {}
+            server = str(headers.get("server", ""))
+            if headers.get("cf-mitigated"):
+                server += f" cf-mitigated={headers.get('cf-mitigated')}"
+        except Exception:
+            pass
+        failures.append(f"{method}: HTTP {status_code}" + (f" server={server}" if server else ""))
+        print(f"[FETCH] HTTP {status_code}; server={server or 'unknown'}; body={body_preview!r}")
+
+        # On /debug with a forced method, return the actual 4xx page so the
+        # existing debug screen can show its status, URL and extracted links.
+        if forced_method:
+            return response, links
+
+        has_fallback = index < len(candidates) - 1
+        if status_code in retry_status_codes and has_fallback:
+            print(f"[FETCH] HTTP {status_code}; trying fallback {candidates[index + 1]}")
+            continue
+
+        break
+
+    if last_response is not None:
+        status_code = int(getattr(last_response, "status_code", 0) or 0)
+        body_preview = re.sub(r"\s+", " ", str(getattr(last_response, "text", "") or "")).strip()[:500]
+        tried = ", ".join(candidates)
+        details = "; ".join(failures[-5:])
+        raise RuntimeError(
+            f"HTTP {status_code} while fetching {getattr(last_response, 'url', url)}. "
+            f"Methods tried: {tried}. {details}. Response preview: {body_preview or '[empty body]'}"
+        )
+
+    raise RuntimeError(
+        f"Could not fetch {url}. Methods tried: {', '.join(candidates)}. "
+        + "; ".join(failures[-5:])
+    )
 
 
 # ============================================================
@@ -1824,6 +1997,65 @@ async def resolve_route(
                 )
 
         # ----------------------------------------------------
+        # Optional route fallback when a successful HTTP fetch did not
+        # expose the expected target (for example, a link added by JS).
+        # By default this runs only on step 1, where fetch_method belongs
+        # to the main host configured by this route.
+        # ----------------------------------------------------
+
+        if (
+            selected is None
+            and step_number == 1
+            and route.get("fallback_if_missing_target", False)
+        ):
+            fallback_values = route.get("fallback_methods", [])
+            if isinstance(fallback_values, str):
+                fallback_values = [fallback_values]
+
+            for fallback_method in fallback_values if isinstance(fallback_values, list) else []:
+                try:
+                    fallback_method = normalize_fetch_method(fallback_method)
+                    if fallback_method == "auto":
+                        continue
+                    print(
+                        f"[STEP {step_number}] Target not found; retrying with {fallback_method}"
+                    )
+                    fallback_response, fallback_links = await fetch_page(
+                        session,
+                        current_url,
+                        method_override=fallback_method
+                    )
+                except Exception as fallback_error:
+                    print(
+                        f"[STEP {step_number}] Fallback {fallback_method} failed:",
+                        repr(fallback_error)
+                    )
+                    continue
+
+                if int(getattr(fallback_response, "status_code", 0) or 0) >= 400:
+                    print(
+                        f"[STEP {step_number}] Fallback {fallback_method} returned HTTP "
+                        f"{fallback_response.status_code}"
+                    )
+                    continue
+
+                for target in targets:
+                    if domain_matches(fallback_response.url, target):
+                        selected = fallback_response.url
+                        break
+
+                if selected is None:
+                    selected = find_target_link(fallback_links, targets)
+
+                if selected:
+                    response, links = fallback_response, fallback_links
+                    print(
+                        f"[STEP {step_number}] Fallback match using {fallback_method}: "
+                        f"{selected}"
+                    )
+                    break
+
+        # ----------------------------------------------------
         # Nothing found
         # ----------------------------------------------------
 
@@ -1961,9 +2193,11 @@ async def debug_page(
                 "session"
             ] = session
 
+        debug_method = context.user_data.get("debug_method", "auto")
         response, links = await fetch_page(
             session,
-            url
+            url,
+            method_override=debug_method
         )
 
         # Save debug state
@@ -2783,7 +3017,19 @@ async def debug_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    # Optional advanced diagnostic: /debug auto|requests|curl_cffi|browser
+    raw_method = context.args[0] if context.args else "auto"
+    try:
+        debug_method = normalize_fetch_method(raw_method)
+    except ValueError as exc:
+        await update.message.reply_text(
+            "❌ " + html.escape(str(exc)),
+            parse_mode="HTML"
+        )
+        return
+
     context.user_data.clear()
+    context.user_data["debug_method"] = debug_method
 
     context.user_data[
         "session"
