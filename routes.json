@@ -27,9 +27,9 @@
             },
             {
                 "targets": [
-                    "pixel.hubcloud.ist",
-                    "gpdl.hubcloud.ist",
-                    "gpdl2.hubcloud.ist"
+                    "pixel.hubcloud.pw",
+                    "gpdl.hubcloud.pw",
+                    "gpdl2.hubcloud.pw"
                 ]
             }
         ],
