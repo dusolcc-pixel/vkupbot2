@@ -7,9 +7,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium \
-    && rm -rf /root/.cache/pip /var/lib/apt/lists/*
+# Install required Linux system libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright Chromium and its dependencies
+RUN python -m playwright install --with-deps chromium
+
+# Clean up
+RUN rm -rf /root/.cache/pip /var/lib/apt/lists/*
 
 COPY main.py ./
 COPY routes.json ./
