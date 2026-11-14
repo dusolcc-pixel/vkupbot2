@@ -1,0 +1,58 @@
+VKUPBOT2 - GOOGLE DRIVE + GOFILE WORKER SETUP
+=============================================
+
+The bot now supports Google Drive file-share links and GoFile folder-share
+links. Configure the Worker URLs in your hosting provider's Environment /
+Settings page. The bot reads these values from environment variables.
+
+REQUIRED / OPTIONAL ENVIRONMENT VARIABLES
+
+GoFile signed-download Worker:
+  GOFILE_WORKER_URL=https://your-gofile-worker.workers.dev
+  GOFILE_WORKER_USERNAME=the-same-value-as-OPTIONAL_USER
+  GOFILE_WORKER_PASSWORD=the-same-value-as-OPTIONAL_PASS
+
+Google Drive download Worker:
+  GOOGLE_DRIVE_WORKER_URL=https://your-google-drive-worker.workers.dev
+  GOOGLE_DRIVE_WORKER_TOKEN=your-worker-token-if-configured
+
+URL SETTINGS
+
+- Use only the base Worker URL. Do not append /admin, /generate.aspx, or a
+  trailing endpoint path.
+- GOFILE_WORKER_USERNAME and GOFILE_WORKER_PASSWORD must match the GoFile
+  Worker's OPTIONAL_USER and OPTIONAL_PASS values when its /admin page is
+  protected. Keep AUTHENTICATION set to "true" in the private signed-download
+  GoFile Worker.
+- GOOGLE_DRIVE_WORKER_TOKEN is only needed when the Google Drive Worker's
+  `token` setting is non-empty. Leave it unset otherwise.
+- Backward-compatible aliases are also accepted: GOFILE_INDEX,
+  GOFILE_ADMIN_USER, GOFILE_ADMIN_PASS, GOOGLE_DRIVE_INDEX,
+  GDRIVE_WORKER_URL, and GOOGLE_DRIVE_TOKEN.
+
+HOW TO USE
+
+Send one or more URLs to the Telegram bot, one URL per line.
+
+- A GoFile share URL (gofile.io/d/FOLDER_ID) is opened through the private
+  /admin index of your GoFile Worker. The bot extracts the signed /d/<token>
+  download links for the files in that folder and replies with one result per
+  file, using the same Open Link and Spacebin buttons as the existing bot.
+- A Google Drive file URL is sent to the Google Drive Worker's
+  /generate.aspx?id=FILE_ID endpoint. The bot replies with the generated
+  download link using the same existing result buttons.
+- Existing bypass routes, pack scanning, commands, and bot interface remain
+  in place. Ordinary links still use the existing route resolver.
+
+LIMITATIONS
+
+- The supplied Google Drive Worker generates links for individual files. It
+  does not enumerate Google Drive folders, so send a file share URL rather
+  than a Drive folder URL.
+- The supplied Google Drive Worker downloads through Drive API `alt=media`.
+  Google-native Docs/Sheets/Slides may require export handling in that Worker;
+  regular files stored in Drive are the intended input.
+- The GoFile Worker lists up to the first 1,000 items returned by its current
+  folder-listing request.
+
+Do not commit real Worker credentials or tokens to a public repository.

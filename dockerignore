@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.cache/
+.tmp/
+.acl-python/
+.runtime-home/
+.git/
+.gitignore
+*.zip
+*.log
