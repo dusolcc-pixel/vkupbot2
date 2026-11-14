@@ -68,8 +68,8 @@ TELEGRAM_SAFE_LIMIT = 3900
 # Configure these in your hosting provider's Environment / Settings.
 # Do not paste private passwords or tokens into public source control.
 #
-# GoFile uses the private admin index on your signed-download Worker.
-# Set the same admin username/password configured in that Worker.
+# GoFile uses a private JSON endpoint on your signed-download Worker.
+# The bot authenticates with a dedicated API key, not the browser admin login.
 #
 # Google Drive uses the /generate.aspx?id=<FILE_ID> endpoint from your
 # Google Drive download Worker. A token is only needed if that Worker
@@ -79,14 +79,12 @@ GOFILE_WORKER_URL = (
     or os.getenv("GOFILE_INDEX")
     or ""
 ).strip().rstrip("/")
-GOFILE_WORKER_USERNAME = (
-    os.getenv("GOFILE_WORKER_USERNAME")
-    or os.getenv("GOFILE_ADMIN_USER")
-    or ""
-).strip()
-GOFILE_WORKER_PASSWORD = (
-    os.getenv("GOFILE_WORKER_PASSWORD")
-    or os.getenv("GOFILE_ADMIN_PASS")
+# Machine-to-machine key for the GoFile Worker's /api/folder-links endpoint.
+# This is separate from OPTIONAL_USER / OPTIONAL_PASS, which only protect
+# the human-facing /admin page in a browser.
+GOFILE_API_KEY = (
+    os.getenv("GOFILE_API_KEY")
+    or os.getenv("GOFILE_BOT_API_KEY")
     or ""
 ).strip()
 
@@ -540,58 +538,68 @@ def extract_google_drive_file_id(link):
 
 
 def _fetch_gofile_worker_links(link):
-    """Fetch signed per-file URLs from the GoFile Worker private admin index."""
+    """Fetch signed download URLs from the Worker's private JSON API."""
     if not GOFILE_WORKER_URL:
         raise RuntimeError(
             "GoFile support is not configured. Set GOFILE_WORKER_URL in your hosting settings."
         )
+    if not GOFILE_API_KEY:
+        raise RuntimeError(
+            "GoFile support needs GOFILE_API_KEY in your bot hosting settings. "
+            "It must match BOT_API_KEY in your GoFile Worker."
+        )
 
     folder_id = extract_gofile_folder_id(link)
-    admin_url = GOFILE_WORKER_URL + "/admin"
-    auth = None
-    if GOFILE_WORKER_USERNAME and GOFILE_WORKER_PASSWORD:
-        auth = (GOFILE_WORKER_USERNAME, GOFILE_WORKER_PASSWORD)
-
+    api_url = GOFILE_WORKER_URL + "/api/folder-links"
     response = requests.get(
-        admin_url,
+        api_url,
         params={"folder": folder_id},
-        auth=auth,
         headers={
-            "Accept": "text/html,application/xhtml+xml",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {GOFILE_API_KEY}",
             "User-Agent": "VKUpBot2/CloudWorkerIntegration",
         },
         timeout=CLOUD_WORKER_TIMEOUT,
     )
 
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
     if response.status_code in (401, 403):
         raise RuntimeError(
-            "The GoFile Worker rejected its admin credentials. Set "
-            "GOFILE_WORKER_USERNAME and GOFILE_WORKER_PASSWORD to the same "
-            "credentials configured in the Worker's /admin protection."
+            "The GoFile Worker rejected GOFILE_API_KEY. Make sure it exactly matches "
+            "BOT_API_KEY in the GoFile Worker configuration."
         )
+    if not response.ok:
+        detail = payload.get("error") or payload.get("detail") or response.text[:500]
+        raise RuntimeError(f"GoFile Worker API returned HTTP {response.status_code}: {detail}")
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        detail = payload.get("error", "Unexpected JSON response from GoFile Worker") if isinstance(payload, dict) else "Invalid JSON response"
+        raise RuntimeError(f"GoFile Worker API error: {detail}")
 
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    files = payload.get("files") or []
     found = []
     seen = set()
+    worker_host = _url_host(GOFILE_WORKER_URL)
 
-    for anchor in soup.select("tr.file-row a.filename[href], tr.file-row a[href^='/d/']"):
-        href = (anchor.get("href") or "").strip()
-        if not href:
+    for item in files:
+        if not isinstance(item, dict):
             continue
-
-        absolute = urljoin(GOFILE_WORKER_URL + "/", href.lstrip("/"))
-        parsed_link = urlparse(absolute)
-        base_host = _url_host(GOFILE_WORKER_URL)
-        if parsed_link.scheme not in {"http", "https"} or parsed_link.hostname != base_host:
+        candidate = item.get("url")
+        if not isinstance(candidate, str) or not candidate:
             continue
-        if not re.fullmatch(r"/d/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", parsed_link.path):
+        parsed_link = urlparse(candidate)
+        if (
+            parsed_link.scheme not in {"http", "https"}
+            or (parsed_link.hostname or "").lower().rstrip(".") != worker_host
+            or not re.fullmatch(r"/d/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", parsed_link.path)
+        ):
             continue
-
-        if absolute not in seen:
-            seen.add(absolute)
-            found.append(absolute)
-
+        if candidate not in seen:
+            seen.add(candidate)
+            found.append(candidate)
         if len(found) >= MAX_CLOUD_LINKS_PER_FOLDER:
             break
 
