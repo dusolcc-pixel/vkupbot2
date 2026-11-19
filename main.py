@@ -680,6 +680,79 @@ def _fetch_google_drive_worker_link(link):
     return final_url
 
 
+def _fetch_google_drive_worker_folder_links(link):
+    """Recursively list a Google Drive folder and return one signed Worker URL per file."""
+    if not GOOGLE_DRIVE_WORKER_URL:
+        raise RuntimeError(
+            "Google Drive support is not configured. Set GOOGLE_DRIVE_WORKER_URL in your hosting settings."
+        )
+    if not GOOGLE_DRIVE_WORKER_TOKEN:
+        raise RuntimeError(
+            "Google Drive folder links need GOOGLE_DRIVE_API_KEY in your bot hosting settings. "
+            "It must match BOT_API_KEY in your Google Drive Worker."
+        )
+
+    folder_id = extract_google_drive_folder_id(link)
+    response = requests.post(
+        GOOGLE_DRIVE_WORKER_URL + "/api/folder-links",
+        json={"folder_id": folder_id},
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GOOGLE_DRIVE_WORKER_TOKEN}",
+            "User-Agent": "VKUpBot2/GoogleDriveFolderLinks",
+        },
+        timeout=(20, 180),
+    )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            "The Google Drive Worker rejected GOOGLE_DRIVE_API_KEY. Make sure it exactly matches "
+            "BOT_API_KEY in the Worker configuration."
+        )
+    if not response.ok:
+        detail = payload.get("error") or payload.get("detail") or response.text[:500]
+        raise RuntimeError(f"Google Drive Worker returned HTTP {response.status_code}: {detail}")
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        detail = payload.get("error", "Unexpected response from Google Drive Worker") if isinstance(payload, dict) else "Invalid JSON response"
+        raise RuntimeError(str(detail))
+
+    worker_host = _url_host(GOOGLE_DRIVE_WORKER_URL)
+    validated_files = []
+    seen_urls = set()
+    for item in payload.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        candidate = str(item.get("url") or "").strip()
+        parsed = urlparse(candidate)
+        query = parse_qs(parsed.query)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or (parsed.hostname or "").lower().rstrip(".") != worker_host
+            or parsed.path != "/download.aspx"
+            or not (query.get("t") or [""])[0]
+            or candidate in seen_urls
+        ):
+            continue
+        seen_urls.add(candidate)
+        validated_files.append({
+            "name": str(item.get("name") or f"Google Drive file {len(validated_files) + 1}"),
+            "url": candidate,
+        })
+        if len(validated_files) >= MAX_CLOUD_LINKS_PER_FOLDER:
+            break
+
+    return {
+        "folder_name": str(payload.get("folder_name") or "Google Drive folder"),
+        "files": validated_files,
+    }
+
+
 def _create_google_drive_packs(link):
     """Ask the Google Drive Worker to recursively build shareable packs for a folder."""
     if not GOOGLE_DRIVE_WORKER_URL:
@@ -870,6 +943,52 @@ async def process_cloud_link(update, context, supplied_url):
 
     try:
         if kind == "google_drive":
+            # A plain folder URL (without /pack) should expand into individual
+            # signed Worker download links. Ordinary file URLs keep the old path.
+            try:
+                extract_google_drive_folder_id(supplied_url)
+                is_drive_folder = True
+            except ValueError:
+                is_drive_folder = False
+
+            if is_drive_folder:
+                progress = await update.message.reply_text(
+                    "⏳ Scanning the Google Drive folder and generating individual download links…",
+                    disable_web_page_preview=True,
+                )
+                folder_result = await asyncio.to_thread(
+                    _fetch_google_drive_worker_folder_links,
+                    supplied_url,
+                )
+                files = folder_result["files"]
+                if not files:
+                    await progress.edit_text(
+                        "❌ No downloadable files were found in this Google Drive folder or its subfolders.",
+                        disable_web_page_preview=True,
+                    )
+                    return True
+
+                await progress.edit_text(
+                    f"✅ Found {len(files)} files in <b>{html.escape(folder_result['folder_name'])}</b>. "
+                    "Sending individual download links…",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                for index, item in enumerate(files, start=1):
+                    filename = item["name"]
+                    label = f"Google Drive file {index}/{len(files)}: {filename}"
+                    await send_generated_link_result(
+                        update,
+                        context,
+                        item["url"],
+                        label,
+                    )
+                    # Keep Telegram API traffic gentle for folders with many files.
+                    if index < len(files):
+                        await asyncio.sleep(TELEGRAM_CLOUD_RESULT_DELAY)
+                return True
+
+            # Normal single-file Google Drive links retain their existing behaviour.
             final_url = await asyncio.to_thread(
                 _fetch_google_drive_worker_link,
                 supplied_url,
