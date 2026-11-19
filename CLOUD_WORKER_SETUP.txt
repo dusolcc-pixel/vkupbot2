@@ -60,3 +60,78 @@ TROUBLESHOOTING
 The bot lists regular files in the submitted folder, up to the configured
 MAX_CLOUD_LINKS_PER_FOLDER limit. It does not recursively traverse subfolders.
 Do not commit any real API keys, passwords, or signing secrets to public Git.
+
+GOOGLE DRIVE FOLDER PACK FEATURE (NEW)
+=====================================
+
+Deploy google_drive_worker.js as a Cloudflare Worker using the module-worker
+format. The existing single-file endpoint remains /generate.aspx. The new
+folder pack endpoint is POST /api/packs/create, and public pack pages use /p/<id>.
+
+Create a Cloudflare KV namespace and bind it with the exact name:
+  PACKS
+
+Set these Cloudflare Worker secrets:
+  GOOGLE_CLIENT_ID
+  GOOGLE_CLIENT_SECRET
+  GOOGLE_REFRESH_TOKEN
+  BOT_API_KEY
+  LINK_SIGNING_SECRET
+
+BOT_API_KEY and LINK_SIGNING_SECRET must be different random values, each at
+least 32 characters long. The bot's GOOGLE_DRIVE_API_KEY must exactly match
+Worker BOT_API_KEY. Keep LINK_SIGNING_SECRET only in Cloudflare.
+
+Optional Worker variables:
+  FILE_LINK_EXPIRY_DAYS=7
+  PACK_PAGE_EXPIRY_DAYS=7
+  PACK_MAX_FILES=1000
+  PACK_MAX_FOLDERS=500
+  PACK_MAX_DEPTH=20
+
+For service-account authentication, set GOOGLE_SERVICE_ACCOUNT_JSON instead
+of the three OAuth variables. Share the Google Drive folder with the service
+account email.
+
+Bot hosting variables:
+  GOOGLE_DRIVE_WORKER_URL=https://your-google-drive-worker.workers.dev
+  GOOGLE_DRIVE_API_KEY=the-exact-same-value-as-BOT_API_KEY
+
+Use the base Worker URL only. Do not add /generate.aspx or /api/packs/create.
+
+Usage:
+  /pack https://drive.google.com/drive/folders/FOLDER_ID
+
+The Worker recursively traverses nested Drive folders, groups TV files by
+series + season + release suffix, and creates one shareable pack page per group.
+Randomly named nested folders do not affect TV grouping when filenames contain
+season/episode identifiers. Each page displays the original filenames, Download
+buttons and a Copy all links button. Raw signed URLs are not displayed.
+
+Pack naming removes the episode code and file extension while preserving the
+release details. For example, these files:
+  Sawaranaide.Kotesashi-kun.S01E01.1080p.Blu-Ray.REMUX.AVC.LPCM.2.0-YOKAI.mkv
+  Sawaranaide.Kotesashi-kun.S01E02.1080p.Blu-Ray.REMUX.AVC.LPCM.2.0-YOKAI.mkv
+produce this pack name:
+  Sawaranaide.Kotesashi-kun.S01.1080p.Blu-Ray.REMUX.AVC.LPCM.2.0-YOKAI
+
+Non-episodic files are grouped into a collection named after the submitted root
+folder. Google Docs, Sheets, Slides and Drive shortcuts are skipped because the
+current signed download path serves binary files.
+
+SECURITY ACTION REQUIRED
+------------------------
+The previously uploaded Worker source contained exposed credentials and
+secrets. Revoke/rotate the exposed Google OAuth refresh token and client secret,
+then create new BOT_API_KEY and LINK_SIGNING_SECRET values before deployment.
+Store credentials as Worker secrets / bot environment variables; never embed
+them in source code or commit them to Git.
+
+
+SECURITY ACTION REQUIRED
+------------------------
+The previously uploaded Worker source contained exposed credentials and
+secrets. Revoke/rotate the exposed Google OAuth refresh token and client secret,
+then replace BOT_API_KEY and LINK_SIGNING_SECRET with new random values before
+deployment. Store these values as Cloudflare secrets and bot-host environment
+variables only. Do not embed real credentials in source code or commit them to Git.

@@ -1,6 +1,6 @@
 {
     "gdflix": {
-        "main_domain": "new7.gdflix.io",
+        "main_domain": "new10.gdflix.io",
         "steps": [
             {
                 "targets": [
@@ -17,7 +17,7 @@
         ]
     },
     "hubcloud": {
-        "main_domain": "hubcloud.pw",
+        "main_domain": "hubcloud.mov",
         "steps": [
             {
                 "targets": [
@@ -27,9 +27,9 @@
             },
             {
                 "targets": [
-                    "pixel.hubcloud.pw",
-                    "gpdl.hubcloud.pw",
-                    "gpdl2.hubcloud.pw"
+                    "pixel.hubcloud.mov",
+                    "gpdl.hubcloud.mov",
+                    "gpdl2.hubcloud.mov"
                 ]
             }
         ],

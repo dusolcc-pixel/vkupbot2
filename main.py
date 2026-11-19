@@ -71,9 +71,10 @@ TELEGRAM_SAFE_LIMIT = 3900
 # GoFile uses a private JSON endpoint on your signed-download Worker.
 # The bot authenticates with a dedicated API key, not the browser admin login.
 #
-# Google Drive uses the /generate.aspx?id=<FILE_ID> endpoint from your
-# Google Drive download Worker. A token is only needed if that Worker
-# has its `token` setting configured to a non-empty value.
+# Google Drive uses the authenticated /generate.aspx?id=<FILE_ID> endpoint.
+# GOOGLE_DRIVE_API_KEY (or the legacy GOOGLE_DRIVE_WORKER_TOKEN variable)
+# must match BOT_API_KEY in the Google Drive Worker. The Worker signs the
+# returned download URL with its own LINK_SIGNING_SECRET; the bot never sees it.
 GOFILE_WORKER_URL = (
     os.getenv("GOFILE_WORKER_URL")
     or os.getenv("GOFILE_INDEX")
@@ -95,7 +96,8 @@ GOOGLE_DRIVE_WORKER_URL = (
     or ""
 ).strip().rstrip("/")
 GOOGLE_DRIVE_WORKER_TOKEN = (
-    os.getenv("GOOGLE_DRIVE_WORKER_TOKEN")
+    os.getenv("GOOGLE_DRIVE_API_KEY")
+    or os.getenv("GOOGLE_DRIVE_WORKER_TOKEN")
     or os.getenv("GOOGLE_DRIVE_TOKEN")
     or ""
 ).strip()
@@ -504,6 +506,22 @@ def extract_gofile_folder_id(link):
     raise ValueError("Could not find a GoFile folder ID in this URL.")
 
 
+def extract_google_drive_folder_id(link):
+    """Extract a folder ID from a standard Google Drive folder URL."""
+    parsed = urlparse((link or "").strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host not in {"drive.google.com", "www.drive.google.com"}:
+        raise ValueError("Send a Google Drive folder URL.")
+
+    match = re.search(r"/drive/(?:u/\d+/)?folders/([A-Za-z0-9_-]+)", parsed.path or "", re.IGNORECASE)
+    if not match:
+        raise ValueError(
+            "Could not find a Google Drive folder ID. Use a URL like "
+            "https://drive.google.com/drive/folders/FOLDER_ID."
+        )
+    return match.group(1)
+
+
 def extract_google_drive_file_id(link):
     """Extract a file ID from a supported Google Drive file share URL."""
     parsed = urlparse(link)
@@ -514,8 +532,8 @@ def extract_google_drive_file_id(link):
     path = parsed.path or ""
     if re.search(r"/drive/(?:u/\d+/)?folders/", path, re.IGNORECASE):
         raise ValueError(
-            "This Google Drive Worker supports individual file links, not Drive folder links. "
-            "Send a link to a single file."
+            "For a Google Drive folder, use /pack followed by the folder URL. "
+            "Individual file links continue to work as before."
         )
 
     patterns = (
@@ -613,16 +631,21 @@ def _fetch_google_drive_worker_link(link):
             "Google Drive support is not configured. Set GOOGLE_DRIVE_WORKER_URL in your hosting settings."
         )
 
+    if not GOOGLE_DRIVE_WORKER_TOKEN:
+        raise RuntimeError(
+            "Google Drive support needs GOOGLE_DRIVE_API_KEY in your bot hosting settings. "
+            "It must match BOT_API_KEY in your Google Drive Worker."
+        )
+
     file_id = extract_google_drive_file_id(link)
     params = {"id": file_id, "pretty": "true"}
-    if GOOGLE_DRIVE_WORKER_TOKEN:
-        params["token"] = GOOGLE_DRIVE_WORKER_TOKEN
 
     response = requests.get(
         GOOGLE_DRIVE_WORKER_URL + "/generate.aspx",
         params=params,
         headers={
             "Accept": "application/json",
+            "Authorization": f"Bearer {GOOGLE_DRIVE_WORKER_TOKEN}",
             "User-Agent": "VKUpBot2/CloudWorkerIntegration",
         },
         timeout=CLOUD_WORKER_TIMEOUT,
@@ -630,8 +653,8 @@ def _fetch_google_drive_worker_link(link):
 
     if response.status_code in (401, 403):
         raise RuntimeError(
-            "The Google Drive Worker rejected the request. Check "
-            "GOOGLE_DRIVE_WORKER_TOKEN against the Worker's configured token."
+            "The Google Drive Worker rejected GOOGLE_DRIVE_API_KEY. Make sure it exactly "
+            "matches BOT_API_KEY in the Google Drive Worker configuration."
         )
 
     response.raise_for_status()
@@ -655,6 +678,153 @@ def _fetch_google_drive_worker_link(link):
     ):
         raise RuntimeError("The Google Drive Worker returned an invalid download URL.")
     return final_url
+
+
+def _create_google_drive_packs(link):
+    """Ask the Google Drive Worker to recursively build shareable packs for a folder."""
+    if not GOOGLE_DRIVE_WORKER_URL:
+        raise RuntimeError(
+            "Google Drive support is not configured. Set GOOGLE_DRIVE_WORKER_URL in your hosting settings."
+        )
+    if not GOOGLE_DRIVE_WORKER_TOKEN:
+        raise RuntimeError(
+            "Google Drive pack creation needs GOOGLE_DRIVE_API_KEY in your bot hosting settings. "
+            "It must match BOT_API_KEY in your Google Drive Worker."
+        )
+
+    folder_id = extract_google_drive_folder_id(link)
+    response = requests.post(
+        GOOGLE_DRIVE_WORKER_URL + "/api/packs/create",
+        json={"folder_id": folder_id},
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GOOGLE_DRIVE_WORKER_TOKEN}",
+            "User-Agent": "VKUpBot2/GoogleDrivePackIntegration",
+        },
+        timeout=(20, 180),
+    )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            "The Google Drive Worker rejected GOOGLE_DRIVE_API_KEY. Make sure it exactly matches "
+            "BOT_API_KEY in the Worker configuration."
+        )
+    if not response.ok:
+        detail = payload.get("error") or payload.get("detail") or response.text[:500]
+        raise RuntimeError(f"Google Drive Worker returned HTTP {response.status_code}: {detail}")
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        detail = payload.get("error", "Unexpected response from Google Drive Worker") if isinstance(payload, dict) else "Invalid JSON response"
+        raise RuntimeError(str(detail))
+
+    worker_host = _url_host(GOOGLE_DRIVE_WORKER_URL)
+    validated_packs = []
+    for pack in payload.get("packs") or []:
+        if not isinstance(pack, dict):
+            continue
+        pack_url = str(pack.get("url") or "").strip()
+        parsed = urlparse(pack_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or (parsed.hostname or "").lower().rstrip(".") != worker_host
+            or not re.fullmatch(r"/p/[A-Za-z0-9_-]+", parsed.path or "")
+        ):
+            continue
+        validated_packs.append({
+            "name": str(pack.get("name") or "Untitled pack"),
+            "count": max(0, int(pack.get("count") or 0)),
+            "url": pack_url,
+        })
+
+    if not validated_packs:
+        raise RuntimeError("The Worker completed the request but did not return any valid pack pages.")
+
+    return {
+        "folder_name": str(payload.get("folder_name") or "Google Drive folder"),
+        "total_files": max(0, int(payload.get("total_files") or 0)),
+        "packs": validated_packs,
+    }
+
+
+async def pack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create per-season/release packs from a Google Drive folder URL."""
+    message = update.effective_message
+    supplied = " ".join(context.args or []).strip()
+    if not supplied:
+        await message.reply_text(
+            "Usage: /pack https://drive.google.com/drive/folders/FOLDER_ID\n\n"
+            "The bot will scan nested folders and automatically group TV files by show, season and release."
+        )
+        return
+
+    try:
+        # Validate the link before showing a progress message.
+        extract_google_drive_folder_id(supplied)
+    except Exception as exc:
+        await message.reply_text(f"❌ {html.escape(str(exc))}")
+        return
+
+    progress = await message.reply_text(
+        "⏳ Scanning the Google Drive folder and generating packs…",
+        disable_web_page_preview=True,
+    )
+
+    try:
+        result = await asyncio.to_thread(_create_google_drive_packs, supplied)
+        packs = result["packs"]
+        lines = [
+            "📦 <b>PACK GENERATION COMPLETED</b>",
+            f"Folder: <b>{html.escape(result['folder_name'])}</b>",
+            f"Total files: <b>{result['total_files']}</b>",
+            f"Packs created: <b>{len(packs)}</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for index, pack in enumerate(packs, start=1):
+            lines.extend([
+                "",
+                f"<b>{index}. {html.escape(pack['name'])}</b>",
+                f"📁 {pack['count']} files",
+                f'🔗 <a href="{html.escape(pack["url"], quote=True)}">Open pack</a>',
+            ])
+
+        # Keep every Telegram message below Telegram's text limit.
+        chunks = []
+        current = ""
+        for line in lines:
+            candidate = (current + "\n" + line) if current else line
+            if len(candidate) > TELEGRAM_SAFE_LIMIT - 100 and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        await progress.edit_text(
+            chunks[0],
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        for chunk in chunks[1:]:
+            await message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+    except Exception as exc:
+        print("[GOOGLE DRIVE PACK ERROR]", repr(exc))
+        await progress.edit_text(
+            "❌ <b>Pack generation failed</b>\n\n"
+            f"<code>{html.escape(str(exc)[:1800])}</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 async def send_generated_link_result(update, context, final_url, title="Link resolved"):
@@ -5175,6 +5345,13 @@ def main():
         CommandHandler(
             "start",
             start_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "pack",
+            pack_command
         )
     )
 
